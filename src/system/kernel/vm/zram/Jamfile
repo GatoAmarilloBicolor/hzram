@@ -1,0 +1,14 @@
+# Jamfile for zram kernel module
+# Build zram as a kernel module that can be loaded at boot time
+
+# Compile zram_core (standalone, no kernel dependencies)
+COMPILE zram_core.o zram_core.cpp
+
+# Compile zram_kernel (depends on zram_core and kernel headers)
+COMPILE zram_kernel.o zram_kernel.cpp
+
+# Create the module
+MODULE zram.o zram_core.o zram_kernel.o
+
+# List of objects for this module
+OBJECTS zram.o
