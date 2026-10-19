@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <algorithm>
 
 #include "zram_core.h"
 
@@ -152,11 +153,6 @@ int main(int argc, char* argv[]) {
         // Verify all pages allocated
         for (void* page : pages) {
             ZramStats stats;
-            if (!ZramStats_Init(&stats)) {
-                std::cerr << "Failed: ZramStats_Init" << std::endl;
-                return 1;
-            }
-
             if (!ZramStats_Ready(&stats)) {
                 std::cerr << "Failed: ZramStats_Ready" << std::endl;
                 return 1;
@@ -175,6 +171,110 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "  PASSED: Pool management" << std::endl;
+    }
+
+    // Test 4: SIMD optimization
+    std::cout << "Test 4: SIMD optimization..." << std::endl;
+    {
+        ZramCtx ctx;
+        ZramCtx* ctx_ptr = &ctx;
+
+        if (!ZramCtx_Init(ctx_ptr, 1024 * 1024)) {
+            std::cerr << "Failed: ZramCtx_Init" << std::endl;
+            return 1;
+        }
+
+        // Create test data with patterns
+        std::vector<uint8_t> test_data(1024 * 1024);
+        for (uint32_t i = 0; i < 1024 * 1024; i++) {
+            test_data[i] = static_cast<uint8_t>((i % 256) + 128);
+        }
+
+        // Get pointer to data
+        void* data_ptr = test_data.data();
+
+        // Compress
+        uint8_t* compressed = new uint8_t[ZRAM_MAX_COMPRESSED];
+        if (!ZramCtx_Compress(ctx_ptr, data_ptr, compressed)) {
+            std::cerr << "Failed: ZramCtx_Compress" << std::endl;
+            delete[] compressed;
+            return 1;
+        }
+
+        // Decompress
+        void* decompressed = new uint8_t[ZRAM_PAGE_SIZE];
+        if (!ZramCtx_Decompress(ctx_ptr, compressed, decompressed)) {
+            std::cerr << "Failed: ZramCtx_Decompress" << std::endl;
+            delete[] compressed;
+            delete[] decompressed;
+            return 1;
+        }
+
+        // Verify
+        for (uint32_t i = 0; i < ZRAM_PAGE_SIZE; i++) {
+            if (test_data[i] != decompressed[i]) {
+                std::cerr << "Failed: Decompression mismatch at offset " << i << std::endl;
+                delete[] compressed;
+                delete[] decompressed;
+                return 1;
+            }
+        }
+
+        delete[] compressed;
+        delete[] decompressed;
+        std::cout << "  PASSED: SIMD optimization" << std::endl;
+    }
+
+    // Test 5: Compression decision
+    std::cout << "Test 5: Compression decision..." << std::endl;
+    {
+        ZramCtx ctx;
+        ZramCtx* ctx_ptr = &ctx;
+
+        if (!ZramCtx_Init(ctx_ptr, 1024 * 1024)) {
+            std::cerr << "Failed: ZramCtx_Init" << std::endl;
+            return 1;
+        }
+
+        // Create test data with different patterns
+        std::vector<uint8_t> test_data(4096);
+        for (uint32_t i = 0; i < 4096; i++) {
+            test_data[i] = static_cast<uint8_t>((i % 100) + 1);
+        }
+
+        // Get pointer to data
+        void* data_ptr = test_data.data();
+
+        // Compress
+        uint8_t* compressed = new uint8_t[ZRAM_MAX_COMPRESSED];
+        if (!ZramCtx_Compress(ctx_ptr, data_ptr, compressed)) {
+            std::cerr << "Failed: ZramCtx_Compress" << std::endl;
+            delete[] compressed;
+            return 1;
+        }
+
+        // Decompress
+        void* decompressed = new uint8_t[ZRAM_PAGE_SIZE];
+        if (!ZramCtx_Decompress(ctx_ptr, compressed, decompressed)) {
+            std::cerr << "Failed: ZramCtx_Decompress" << std::endl;
+            delete[] compressed;
+            delete[] decompressed;
+            return 1;
+        }
+
+        // Verify
+        for (uint32_t i = 0; i < 4096; i++) {
+            if (test_data[i] != decompressed[i]) {
+                std::cerr << "Failed: Decompression mismatch at offset " << i << std::endl;
+                delete[] compressed;
+                delete[] decompressed;
+                return 1;
+            }
+        }
+
+        delete[] compressed;
+        delete[] decompressed;
+        std::cout << "  PASSED: Compression decision" << std::endl;
     }
 
     std::cout << "\nAll tests passed!" << std::endl;

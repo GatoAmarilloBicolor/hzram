@@ -10,7 +10,13 @@
 #include <haiku/VMAnonymousCache.h>
 #include <haiku/Process.h>
 #include <haiku/Task.h>
-#include "zram_core.h"
+#include <haiku/Process.h>
+#include <haiku/Thread.h>
+#include <haiku/Task.h>
+#include <haiku/System.h>
+#include <haiku/IO.h>
+#include <haiku/IO.h>
+#include <haiku/IO.h>
 
 /*
  * VMAnonymousCache - the anonymous memory class
@@ -28,9 +34,10 @@ class VMAnonymousCache : public Haiku::VMAnonymousCache {
      */
     struct {
         bool zram_enabled = true;
-        ZramConfig zram_config;
-        ZramCtx* zram_ctx = nullptr;
-        ZramStats zram_stats;
+        uint64_t zram_pool_size = 0;
+        uint8_t compression_quality = 0x02;  /* medium */
+        uint8_t compression_decision = 0x03;  /* AUTO */
+        uint8_t fallback_level = 0x01;      /* SIMD */
     } zram;
 
     /*
