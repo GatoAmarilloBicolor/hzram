@@ -1,14 +1,19 @@
-# Jamfile for zram kernel module
-# Build zram as a kernel module that can be loaded at boot time
+# Jamfile del subsistema zram (capa 1 + capa 2).
+#
+# zram NO es un modulo cargable: se compila dentro del kernel. Los objetos
+# generados deben anadirse a KernelMergeObject kernel_vm.o en
+# src/system/kernel/vm/Jamfile (T0.6 del plan).
 
-# Compile zram_core (standalone, no kernel dependencies)
-COMPILE zram_core.o zram_core.cpp
+SubDir HAIKU_TOP src system kernel vm zram ;
 
-# Compile zram_kernel (depends on zram_core and kernel headers)
-COMPILE zram_kernel.o zram_kernel.cpp
+UsePrivateHeaders shared ;
+UseHeaders [ FDirName $(SUBDIR) $(DOTDOT) ] ;
 
-# Create the module
-MODULE zram.o zram_core.o zram_kernel.o
+# Capa 1 (nucleo, sin dependencias del kernel) + capa 2 (pegamento Haiku).
+KernelMergeObject zram.o :
+	zram_core.cpp
+	zram_kernel.cpp
+	lz4/lz4.c
+;
 
-# List of objects for this module
-OBJECTS zram.o
+OBJECTS zram.o ;

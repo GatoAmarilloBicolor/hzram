@@ -1,11 +1,11 @@
 /*
- * zram_core.h - Optimized zram core with SIMD and intelligent compression
+ * zram_core.h - Standalone zram core (no kernel dependencies)
  *
- * Features:
- * - Intelligent compression evaluation (analyzes page contents)
- * - SIMD optimizations with safe fallbacks
- * - Pool-based memory management
- * - Statistics and monitoring
+ * Capa 1 del diseño (h_zram_plan_implementacion.md, §4). No incluye ninguna
+ * cabecera del kernel: se compila y se prueba en el host con g++.
+ *
+ * La capa 2 (zram_kernel.cpp) implementa ZramPlatformOps con las primitivas
+ * reales de Haiku/BeOS (mutex_*, create_sem, vm_memcpy_*, spawn_thread).
  */
 
 #ifndef ZRAM_CORE_H
@@ -14,72 +14,66 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <cstring>
-#include <cstdint>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*
- * Constants
+ * Constantes
  */
 #define ZRAM_PAGE_SIZE      4096u
 #define ZRAM_SPAN_BYTES     (64u * 1024u)
-#define ZRAM_CHUNK_BYTES    (1024u * 1024u)
+#define ZRAM_CHUNK_BYTES    (1024u * 1024u)       /* 16 spans por chunk */
 #define ZRAM_STRIPES        64u
 #define ZRAM_MAX_COMPRESSED 3072u
 #define ZRAM_CLASS_COUNT    10u
 
-/*
- * SIMD optimization flags
- */
-#define SIMD_SSE2       0x01
-#define SIMD_AVX2       0x02
-#define SIMD_NEON       0x04
-#define SIMD_FALLBACK   0x08
+static const uint32_t kZramClassSize[ZRAM_CLASS_COUNT] =
+    { 256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096 };
+#define ZRAM_CLASS_RAW 9u
+
+/* Tamaño de la reserva inicial de spans */
+#define ZRAM_RESERVE_TARGET 4u
+
+enum ZramState {
+    ZRAM_EMPTY = 0,
+    ZRAM_SAME  = 1,
+    ZRAM_RAW   = 2,
+    ZRAM_LZ4   = 3,
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes");
+static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
+#endif
 
 /*
- * Compression quality levels
+ * ZramSlot - exactamente 16 bytes (verificado con static_assert)
+ *
+ *   [0:8]   data (void*)     -> RAW o LZ4: puntero al objeto
+ *           pattern (uint64_t) -> SAME: palabra repetida
+ *   [8:12]  size (uint32_t)  -> bytes comprimidos (LZ4); 4096 (RAW); 0 resto
+ *   [12:13] state (uint8_t)  -> ZramState
+ *   [13:14] cls (uint8_t)    -> clase de tamaño (RAW o LZ4)
+ *   [14:16] reserved (uint16_t)
  */
-#define ZRAM_COMPRESSION_LOW    0x01  /* Fast, low quality */
-#define ZRAM_COMPRESSION_MED    0x02  /* Balanced */
-#define ZRAM_COMPRESSION_HIGH   0x03  /* Best quality, slower */
+struct ZramSlot {
+    union {
+        void*    data;
+        uint64_t pattern;
+    };
+    uint32_t size;
+    uint8_t  state;
+    uint8_t  cls;
+    uint16_t reserved;
+};
 
-/*
- * Compression quality flags
- */
-#define COMPRESS_LOW        0x01
-#define COMPRESS_MED        0x02
-#define COMPRESS_HIGH       0x03
+struct ZramConfig {
+    uint64_t disk_bytes;     /* tamaño nominal; slots = disk_bytes / 4096 */
+    uint64_t pool_limit;     /* tope de memoria física (múltiplo de CHUNK) */
+};
 
-/*
- * Compression decisions
- */
-#define COMPRESS_ALWAYS     0x01
-#define COMPRESS_NEVER      0x02
-#define COMPRESS_AUTO       0x03  /* Analyze content and decide */
-#define COMPRESS_SMART       0x04  /* Only compress if beneficial */
-
-/*
- * Compression quality decisions
- */
-#define COMPRESS_QUALITY_LOW       0x01  /* Compress to low quality */
-#define COMPRESS_QUALITY_MED       0x02  /* Compress to medium quality */
-#define COMPRESS_QUALITY_HIGH      0x03  /* Compress to high quality */
-
-/*
- * Compression decision flags
- */
-#define DECIDE_COMPRESS         0x01
-#define DECIDE_DECOMPRESS        0x02
-#define DECIDE_NO_OP             0x03
-
-/*
- * Pool management
- */
-#define ZRAM_POOL_MIN_PAGES    16u
-#define ZRAM_POOL_MAX_PAGES    256u
-
-/*
- * Statistics
- */
 struct ZramStats {
     uint64_t pages_same;
     uint64_t pages_raw;
@@ -93,83 +87,86 @@ struct ZramStats {
     uint64_t write_nomem;
     uint64_t read_corrupt;
     uint64_t read_empty;
-    uint64_t compression_savings;
-    uint64_t decompression_savings;
-    uint64_t simd_ops;
-    uint64_t simd_fallbacks;
-    uint64_t compression_time;
-    uint64_t decompression_time;
 };
 
 /*
- * SIMD capabilities
- */
-struct ZramSims {
-    bool sse2_available;
-    bool avx2_available;
-    bool neon_available;
-    bool fallback_available;
-};
-
-/*
- * Compression quality settings
- */
-struct ZramCompress {
-    uint8_t quality;  /* ZRAM_COMPRESSION_LOW/MED/HIGH */
-    uint8_t decision; /* COMPRESS_ALWAYS/NEVER/AUTO/SMART */
-    uint8_t fallback; /* SIMD fallback level */
-};
-
-/*
- * ZramSlot - exactly 16 bytes (static_asserted)
- */
-struct ZramSlot {
-    union {
-        void*    data;       /* RAW or LZ4: pointer to object */
-        uint64_t pattern;    /* SAME: repeated pattern word */
-    };
-    uint32_t size;           /* bytes compressed (LZ4); 4096 (RAW); 0 otherwise */
-    uint8_t  state;          /* ZramState */
-    uint8_t  cls;            /* class index */
-    uint16_t reserved;
-};
-
-/*
- * ZramConfig - configuration passed at creation time
- */
-struct ZramConfig {
-    uint64_t disk_bytes;
-    uint64_t pool_limit;
-    uint64_t compression_quality;
-    uint64_t compression_decision;
-};
-
-/*
- * ZramCtx - opaque context per device
+ * ZramCtx - opaco: estado LZ4 + búfer de salida + página de trabajo.
+ * Los búferes de 4 KiB viven aquí para no usar la pila en la ruta de E/S.
  */
 struct ZramCtx;
 
+/* Búfer de 4 KiB reservado para el pegamento (capa 2). */
+void* zram_ctx_page(ZramCtx* ctx);
+
 /*
- * Platform operations
+ * Operaciones de plataforma - abstraen las primitivas de memoria y locking.
+ *
+ * Reglas:
+ *   - mem_alloc/mem_free: pueden bloquear; solo se llaman en create/destroy.
+ *   - chunk_alloc: NO debe bloquear. Devuelve NULL si no hay memoria.
+ *   - chunk_free: libera un chunk.
+ *   - mutex_*: mutex estándar.
+ *   - sem_*: semáforo contador.
+ *   - cpu_count: número de CPUs lógicas.
+ *   - request_refill: despierta al hilo de reposición (lo llama el núcleo).
  */
-extern "C" {
-    void* ZramCtx_Init(void* ctx, uint64_t pool_limit, const ZramConfig* config);
-    void* ZramCtx_Free(void* ctx);
-    void* ZramCtx_Ready(void* ctx, void* page);
-    void* ZramCtx_TeardownPage(void* ctx, void* page);
-    void* ZramCtx_Compress(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramCtx_Decompress(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramCtx_Stats(void* ctx);
-    void* ZramCtx_Stats_Set(void* ctx, const ZramStats* stats);
-    void* ZramCtx_Stats_Get(void* ctx);
-    void* ZramCtx_SetSims(void* ctx, const ZramSims* sims);
-    void* ZramCtx_GetSims(void* ctx);
-    void* ZramCtx_InitPool(void* ctx, uint64_t pool_limit);
-    void* ZramCtx_FreePool(void* ctx);
-    void* ZramCtx_CompressSmart(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramCtx_CompressSmartFallback(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramCtx_DecompressSmart(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramCtx_DecompressSmartFallback(void* ctx, const void* in, void* out, uint64_t* out_len);
+struct ZramPlatformOps {
+    void*  (*mem_alloc)(size_t);
+    void   (*mem_free)(void*);
+    void*  (*chunk_alloc)(size_t bytes);
+    void   (*chunk_free)(void*, size_t);
+    void*  (*mutex_new)(void);
+    void   (*mutex_lock)(void*);
+    void   (*mutex_unlock)(void*);
+    void   (*mutex_delete)(void*);
+    void*  (*sem_new)(uint32_t count);
+    void   (*sem_acquire)(void*);
+    void   (*sem_release)(void*);
+    void   (*sem_delete)(void*);
+    uint32_t (*cpu_count)(void);
+    void   (*request_refill)(void* user);
+    void*  user;
+};
+
+struct ZramDevice;
+
+/*
+ * API pública del núcleo
+ *
+ * Códigos de retorno: 0 = OK, -1 = ZRAM_E_INVAL, -2 = ZRAM_E_NOMEM,
+ *                     -3 = ZRAM_E_CORRUPT
+ */
+int  zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops,
+                 ZramDevice** out);
+void zram_destroy(ZramDevice* dev);
+
+ZramCtx* zram_ctx_get(ZramDevice* dev);          /* puede bloquear (semáforo) */
+void     zram_ctx_put(ZramDevice* dev, ZramCtx* ctx);
+
+int  zram_write_page(ZramDevice* dev, ZramCtx* ctx, uint32_t slot,
+                     const void* page);
+int  zram_read_page(ZramDevice* dev, uint32_t slot, void* dst);
+void zram_free_slots(ZramDevice* dev, uint32_t first, uint32_t count);
+
+bool zram_can_accept(ZramDevice* dev);           /* no bloquea */
+int  zram_refill(ZramDevice* dev);               /* lo llama el hilo */
+void zram_get_stats(ZramDevice* dev, ZramStats* out);
+bool zram_check_invariants(ZramDevice* dev);     /* solo para pruebas */
+
+/*
+ * Accesores de prueba (solo se compilan con -DZRAM_TESTING).
+ * Permiten observar estados y contadores internos sin romper la opacidad.
+ */
+#ifdef ZRAM_TESTING
+uint8_t  zram_test_slot_state(const ZramDevice* dev, uint32_t slot);
+uint64_t zram_test_stored_bytes(const ZramDevice* dev);
+uint64_t zram_test_pool_bytes(const ZramDevice* dev);
+uint32_t zram_test_reserver_count(const ZramDevice* dev);
+uint64_t zram_test_live_count(const ZramDevice* dev, uint32_t cls);
+#endif
+
+#ifdef __cplusplus
 }
+#endif
 
 #endif /* ZRAM_CORE_H */

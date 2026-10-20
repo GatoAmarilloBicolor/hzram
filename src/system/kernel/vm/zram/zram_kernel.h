@@ -1,61 +1,75 @@
 /*
- * zram_kernel.h - Kernel module API for zram
+ * zram_kernel.h - Pegamento del kernel de zram para Haiku
  *
- * This header defines the interface between the zram kernel module
- * and the rest of the Haiku kernel. It uses platform operations
- * to abstract the host's memory/locking primitives.
+ * Capa 2 del diseño (h_zram_plan_implementacion.md, §6 T6). Implementa
+ * ZramPlatformOps con las primitivas reales de Haiku/BeOS y expone la API
+ * que usa el parche de VMAnonymousCache (capa 3).
+ *
+ * Solo se incluye desde el kernel.
  */
 
 #ifndef ZRAM_KERNEL_H
 #define ZRAM_KERNEL_H
 
-#include <haiku/Haiju.h>
-#include <haiku/VMAnonymousCache.h>
-#include <haiku/Task.h>
-#include <haiku/Process.h>
-#include <haiku/Process.h>
-#include <haiku/Thread.h>
-#include <haiku/Task.h>
-#include <haiku/Thread.h>
-#include <haiku/System.h>
-#include <haiku/IO.h>
-#include <haiku/IO.h>
-#include <haiku/IO.h>
-#include <haiku/IO.h>
-#include <haiku/IO.h>
+#include <OS.h>
+#include <sys/uio.h>
+
+#include "zram_core.h"
+
+/* swap_addr_t se define en VMAnonymousCache.h; lo referenciamos sin
+ * duplicar la definición para no romper el tipo real de Haiku. */
+#include "../VMAnonymousCache.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct ZramKernelDevice;
 
 /*
- * Kernel module exports
+ * Crea un dispositivo zram.
+ *
+ * diskBytes: tamaño nominal en bytes (múltiplo de B_PAGE_SIZE).
+ * poolLimit: tope de memoria cableada (múltiplo de ZRAM_CHUNK_BYTES).
+ * out: recibe el dispositivo.
+ *
+ * Devuelve B_OK o B_NO_MEMORY / B_BAD_VALUE.
  */
-extern "C" {
-    void* ZramKernel_Init(void* ctx);
-    void* ZramKernel_Free(void* ctx);
-    void* ZramKernel_Ready(void* ctx, void* page);
-    void* ZramKernel_TeardownPage(void* ctx, void* page);
-    void* ZramKernel_Compress(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramKernel_Decompress(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramKernel_Stats(void* ctx);
-    void* ZramKernel_Stats_Set(void* ctx, const ZramStats* stats);
-    void* ZramKernel_SetSims(void* ctx, const ZramSims* sims);
-    void* ZramKernel_GetSims(void* ctx);
-    void* ZramKernel_InitPool(void* ctx, uint64_t pool_limit);
-    void* ZramKernel_FreePool(void* ctx);
-    void* ZramKernel_CompressSmart(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramKernel_CompressSmartFallback(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramKernel_DecompressSmart(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramKernel_DecompressSmartFallback(void* ctx, const void* in, void* out, uint64_t* out_len);
-}
+status_t zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
+    ZramKernelDevice** out);
+
+/* Destruye el dispositivo (usado por el parche y por module fini). */
+void zram_kernel_destroy(ZramKernelDevice* dev);
 
 /*
- * Platform operations
+ * Lee páginas del dispositivo.
+ * pos: desplazamiento en bytes (slot * B_PAGE_SIZE).
+ * flags: puede incluir B_PHYSICAL_IO_REQUEST para vectores físicos.
  */
-extern "C" {
-    void* ZramPlatform_Ops_Init(void* ctx);
-    void* ZramPlatform_Ops_Free(void* ctx);
-    void* ZramPlatform_Ready(void* ctx, void* page);
-    void* ZramPlatform_TeardownPage(void* ctx, void* page);
-    void* ZramPlatform_Compress(void* ctx, const void* in, void* out, uint64_t* out_len);
-    void* ZramPlatform_Decompress(void* ctx, const void* in, void* out, uint64_t* out_len);
+status_t zram_swap_read(ZramKernelDevice* dev, off_t pos,
+    const generic_io_vec* vecs, size_t count, uint32_t flags,
+    generic_size_t* numBytes);
+
+/* Escribe páginas en el dispositivo. */
+status_t zram_swap_write(ZramKernelDevice* dev, off_t pos,
+    const generic_io_vec* vecs, size_t count, uint32_t flags,
+    generic_size_t* numBytes);
+
+/* Libera un rango de slots locales [firstSlot, firstSlot + count). */
+void zram_kernel_free(ZramKernelDevice* dev, swap_addr_t firstSlot,
+    uint32_t count);
+
+/* ¿Queda sitio para al menos una página? */
+bool zram_kernel_can_accept(ZramKernelDevice* dev);
+
+void zram_kernel_get_stats(ZramKernelDevice* dev, ZramStats* out);
+bool zram_kernel_check_invariants(ZramKernelDevice* dev);
+
+/* Registra el comando de depuracion "zram" (se llama desde swap_init). */
+void zram_kernel_debug_init(void);
+
+#ifdef __cplusplus
 }
+#endif
 
 #endif /* ZRAM_KERNEL_H */
