@@ -239,8 +239,9 @@ static bool zram_is_same_page(const void* page, uint64_t* pattern)
         if (words[i] != first)
             return false;
     }
-    for (uint32_t i = 8; i < ZRAM_PAGE_SIZE / sizeof(uint64_t); i++) {
-        if (words[i] != first)
+    for (uint32_t i = 8; i < ZRAM_PAGE_SIZE / sizeof(uint64_t); i += 4) {
+        if (words[i] != first || words[i + 1] != first
+                || words[i + 2] != first || words[i + 3] != first)
             return false;
     }
 
@@ -417,9 +418,13 @@ int zram_read_page(ZramDevice* dev, uint32_t slot, void* dst)
             break;
 
         case ZRAM_SAME: {
-            uint64_t* words = (uint64_t*)dst;
-            for (uint32_t i = 0; i < ZRAM_PAGE_SIZE / sizeof(uint64_t); i++)
-                words[i] = s->pattern;
+            if (s->pattern == 0) {
+                memset(dst, 0, ZRAM_PAGE_SIZE);
+            } else {
+                uint64_t* words = (uint64_t*)dst;
+                for (uint32_t i = 0; i < ZRAM_PAGE_SIZE / sizeof(uint64_t); i++)
+                    words[i] = s->pattern;
+            }
             dev->reads++;
             break;
         }

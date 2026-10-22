@@ -258,7 +258,7 @@ status_t zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
         return B_NO_MEMORY;
     }
 
-    dev->refill_thread = spawn_thread(zram_refill_thread, "zram_refill",
+    dev->refill_thread = spawn_kernel_thread(zram_refill_thread, "zram_refill",
         B_NORMAL_PRIORITY, dev);
     if (dev->refill_thread < 0) {
         delete_sem(dev->refill_sem);
@@ -281,16 +281,38 @@ void zram_kernel_destroy(ZramKernelDevice* dev)
     if (dev == NULL)
         return;
 
+    /* Desenlazar de la lista global */
+    if (g_kernel_devices == dev) {
+        g_kernel_devices = dev->next;
+    } else {
+        for (ZramKernelDevice* d = g_kernel_devices; d != NULL; d = d->next) {
+            if (d->next == dev) {
+                d->next = dev->next;
+                break;
+            }
+        }
+    }
+    if (g_kernel_device == dev)
+        g_kernel_device = g_kernel_devices;
+
     dev->refill_done = true;
-    release_sem(dev->refill_sem);
+    if (dev->refill_sem >= 0)
+        release_sem(dev->refill_sem);
 
-    status_t status;
-    wait_for_thread(dev->refill_thread, &status);
+    if (dev->refill_thread >= 0) {
+        status_t status;
+        wait_for_thread(dev->refill_thread, &status);
+    }
 
-    delete_sem(dev->refill_sem);
-    zram_destroy(dev->core);
+    if (dev->refill_sem >= 0)
+        delete_sem(dev->refill_sem);
+
+    if (dev->core != NULL)
+        zram_destroy(dev->core);
+
     if (dev->pool_area >= 0)
         delete_area(dev->pool_area);
+
     free(dev);
 }
 
@@ -474,6 +496,13 @@ static int zram_debug_command(int argc, char** argv)
         kprintf("  pages_lz4:  %" B_PRIu64 "\n", st.pages_lz4);
         kprintf("  orig_bytes: %" B_PRIu64 "\n", st.orig_bytes);
         kprintf("  stored:     %" B_PRIu64 "\n", st.stored_bytes);
+        if (st.stored_bytes > 0 && st.orig_bytes > 0) {
+            uint64_t ratio_int = st.orig_bytes / st.stored_bytes;
+            uint64_t ratio_dec = ((st.orig_bytes * 100) / st.stored_bytes) % 100;
+            uint64_t savings_pct = ((st.orig_bytes - st.stored_bytes) * 100) / st.orig_bytes;
+            kprintf("  ratio:      %" B_PRIu64 ".%02" B_PRIu64 ":1 (savings: %" B_PRIu64 "%%)\n",
+                ratio_int, ratio_dec, savings_pct);
+        }
         kprintf("  writes:     %" B_PRIu64 "\n", st.writes);
         kprintf("  reads:      %" B_PRIu64 "\n", st.reads);
         kprintf("  frees:      %" B_PRIu64 "\n", st.frees);
