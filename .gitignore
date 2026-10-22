@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+zram_test
+zram_test_asan
+
+# macOS
+.DS_Store

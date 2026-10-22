@@ -76,10 +76,10 @@ struct ZramDevice {
     bool destroyed;
 };
 
-struct ZramCtx {
-    LZ4_stream_t state;
-    uint8_t      out_buf[ZRAM_PAGE_SIZE];   /* salida comprimida (máx. 3072) */
-    uint8_t      page[ZRAM_PAGE_SIZE];      /* página de trabajo del pegamento */
+struct alignas(64) ZramCtx {
+    LZ4_stream_t        state;
+    alignas(64) uint8_t out_buf[ZRAM_PAGE_SIZE];   /* salida comprimida (máx. 3072) */
+    alignas(64) uint8_t page[ZRAM_PAGE_SIZE];      /* página de trabajo del pegamento */
 };
 
 /*
@@ -137,11 +137,18 @@ static void* zram_class_alloc(ZramDevice* dev, uint32_t c)
     if (dev->classes[c].free_list == NULL) {
         dev->ops->mutex_lock(dev->reserver_lock);
         void* span = zram_reserver_pop(dev);
+        uint32_t remaining = dev->reserver.count;
         dev->ops->mutex_unlock(dev->reserver_lock);
 
         if (span == NULL) {
             dev->ops->request_refill(dev->ops->user);
-            return NULL;
+            dev->ops->mutex_lock(dev->reserver_lock);
+            span = zram_reserver_pop(dev);
+            dev->ops->mutex_unlock(dev->reserver_lock);
+            if (span == NULL)
+                return NULL;
+        } else if (remaining < 2) {
+            dev->ops->request_refill(dev->ops->user);
         }
         zram_carve_span(dev, span, c);
     }
@@ -162,14 +169,15 @@ static void zram_class_free(ZramDevice* dev, uint32_t c, void* obj)
     dev->classes[c].live_count--;
 }
 
-/* Primera clase cuyo tamaño >= n (nunca la clase RAW, ya que n <= 3072). */
-static uint32_t zram_class_for_size(uint32_t n)
+/* Lookup O(1) sin ramas (O5): (n + 255) >> 8 mapea a la clase adecuada */
+static const uint8_t kSizeToClass[16] = {
+    0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 9
+};
+
+static inline uint32_t zram_class_for_size(uint32_t n)
 {
-    for (uint32_t c = 0; c < ZRAM_CLASS_RAW; c++) {
-        if (kZramClassSize[c] >= n)
-            return c;
-    }
-    return ZRAM_CLASS_RAW;
+    uint32_t idx = (n + 255u) >> 8;
+    return idx < 16u ? (uint32_t)kSizeToClass[idx] : ZRAM_CLASS_RAW;
 }
 
 /*
@@ -366,7 +374,7 @@ int zram_write_page(ZramDevice* dev, ZramCtx* ctx, uint32_t slot,
     if (viejo.state != ZRAM_EMPTY) {
         dev->orig_bytes -= ZRAM_PAGE_SIZE;
         if (viejo.state == ZRAM_RAW || viejo.state == ZRAM_LZ4)
-            dev->stored_bytes -= viejo.size;
+            dev->stored_bytes -= kZramClassSize[viejo.cls];
     }
 
     switch (nuevo.state) {

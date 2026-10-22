@@ -43,11 +43,6 @@ enum ZramState {
     ZRAM_LZ4   = 3,
 };
 
-#ifdef __cplusplus
-static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes");
-static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
-#endif
-
 /*
  * ZramSlot - exactamente 16 bytes (verificado con static_assert)
  *
@@ -68,6 +63,11 @@ struct ZramSlot {
     uint8_t  cls;
     uint16_t reserved;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes");
+static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
+#endif
 
 struct ZramConfig {
     uint64_t disk_bytes;     /* tamaño nominal; slots = disk_bytes / 4096 */

@@ -48,6 +48,7 @@ struct ZramKernelDevice {
     thread_id   refill_thread;
     sem_id      refill_sem;
     volatile bool refill_done;
+    ZramPlatformOps ops;
     ZramKernelDevice* next;
 };
 
@@ -152,7 +153,9 @@ static uint32_t kern_cpu_count(void)
 static void kern_request_refill(void* user)
 {
     ZramKernelDevice* dev = (ZramKernelDevice*)user;
-    if (dev != NULL)
+    if (dev == NULL)
+        dev = g_kernel_device;
+    if (dev != NULL && dev->refill_sem >= 0)
         release_sem(dev->refill_sem);
 }
 
@@ -235,22 +238,25 @@ status_t zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
     dev->pool_limit = poolLimit;
     g_kernel_device = dev;
 
-    ZramConfig cfg = { diskBytes, poolLimit };
-    int rc = zram_create(&cfg, &g_platform_ops, &dev->core);
-    if (rc != 0) {
-        delete_area(area);
-        free(dev);
-        return B_NO_MEMORY;
-    }
-
     dev->refill_sem = create_sem(0, "zram_refill");
     if (dev->refill_sem < 0) {
-        zram_destroy(dev->core);
         delete_area(area);
         free(dev);
         return B_NO_MEMORY;
     }
     dev->refill_done = false;
+
+    dev->ops = g_platform_ops;
+    dev->ops.user = dev;
+
+    ZramConfig cfg = { diskBytes, poolLimit };
+    int rc = zram_create(&cfg, &dev->ops, &dev->core);
+    if (rc != 0) {
+        delete_sem(dev->refill_sem);
+        delete_area(area);
+        free(dev);
+        return B_NO_MEMORY;
+    }
 
     dev->refill_thread = spawn_thread(zram_refill_thread, "zram_refill",
         B_NORMAL_PRIORITY, dev);
