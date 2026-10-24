@@ -529,9 +529,11 @@ zram_debug_command(int argc, char** argv)
 		uint64_t activePages = st.pages_same + st.pages_raw + st.pages_lz4;
 
 		kprintf("zram device %p:\n", dev);
-		kprintf("  Configuration:\n");
-		kprintf("    disk_bytes:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu64 " slots)\n",
-			dev->disk_bytes, dev->disk_bytes / (1024 * 1024), totalPages);
+	kprintf("  Configuration:\n");
+	kprintf("    disk_bytes:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu64 " slots)\n",
+		dev->disk_bytes, dev->disk_bytes / (1024 * 1024), totalPages);
+	kprintf("    compression:         %" B_PRIu32 "%% saved (%" B_PRIu64 " bytes saved)\n",
+		stats.compression_ratio, stats.compr_bytes, stats.compr_bytes);
 		kprintf("    pool_limit:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu32 " chunks)\n",
 			dev->pool_limit, dev->pool_limit / (1024 * 1024), st.chunk_capacity);
 		kprintf("    pool_allocated:     %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu32 " chunks)\n",
