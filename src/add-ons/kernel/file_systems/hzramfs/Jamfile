@@ -1,0 +1,17 @@
+SubDir HAIKU_TOP src add-ons kernel file_systems hzramfs ;
+
+UsePrivateKernelHeaders ;
+UsePrivateHeaders [ FDirName kernel util ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src system kernel vm zram ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src system kernel vm zram lz4 ] ;
+
+SEARCH on [ FGristFiles zram_core.cpp ]
+	+= [ FDirName $(HAIKU_TOP) src system kernel vm zram ] ;
+SEARCH on [ FGristFiles lz4.c ]
+	+= [ FDirName $(HAIKU_TOP) src system kernel vm zram lz4 ] ;
+
+KernelAddon hzramfs :
+	kernel_interface.cpp
+	zram_core.cpp
+	lz4.c
+	;
