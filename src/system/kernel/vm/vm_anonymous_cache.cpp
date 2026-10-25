@@ -22,22 +22,20 @@ extern "C" {
 #include <vm/VMAnonymousCache.h>
 }
 
-/* Forward declarations */
 struct vnode;
 typedef uint32 swap_addr_t;
 
 struct swap_file : DoublyLinkedListLinkImpl<swap_file> {
 	int				fd;
-	struct vnode*	vnode;
+	struct vnode*   vnode;
 	void*			cookie;
 	swap_addr_t		first_slot;
 	swap_addr_t		last_slot;
-	radix_bitmap*	bmp;
+	radix_bitmap*   bmp;
 	ZramKernelDevice* zram;
-	char*			path;		/* original path for lookup */
+	char*			path;
 };
 
-/* Global swap management */
 typedef DoublyLinkedList<swap_file> SwapFileList;
 
 static SwapFileList sSwapFileList;
@@ -47,6 +45,15 @@ static int32 sSwapFileCount = 0;
 static off_t sAvailableSwapSpace = 0;
 
 static swap_file* sSwapFileAlloc = NULL;
+
+/* Forward declarations */
+struct ZramKernelDevice;
+status_t status_t;
+void* void*;
+int32_t int32_t;
+off_t off_t;
+uint32_t uint32_t;
+uint64_t uint64_t;
 
 /* Helper functions */
 static swap_file* swap_file_get(ZramKernelDevice* zram)
@@ -127,10 +134,6 @@ static uint64 parse_number_value(const char* string, uint64 defaultValue)
 		case 'G':
 			value *= 1024ULL * 1024 * 1024;
 			break;
-		case 't':
-		case 'T':
-			value *= 1024ULL * 1024 * 1024 * 1024;
-			break;
 		default:
 			break;
 	}
@@ -140,8 +143,8 @@ static uint64 parse_number_value(const char* string, uint64 defaultValue)
 
 static void parse_path_params(const char* path, uint64* diskBytes, uint64* poolLimit)
 {
-	*diskBytes = 512ULL * 1024 * 1024;	/* default 512MB */
-	*poolLimit = 128ULL * 1024 * 1024;	/* default 128MB */
+	*diskBytes = 512ULL * 1024 * 1024;
+	*poolLimit = 128ULL * 1024 * 1024;
 	
 	if (!path)
 		return;
@@ -158,13 +161,11 @@ static void parse_path_params(const char* path, uint64* diskBytes, uint64* poolL
 		*poolLimit = parse_number_value(pool, *poolLimit);
 	}
 	
-	/* Apply minimums and alignment */
 	if (*diskBytes < 16ULL * 1024 * 1024)
 		*diskBytes = 16ULL * 1024 * 1024;
 	if (*poolLimit < ZRAM_CHUNK_BYTES)
 		*poolLimit = ZRAM_CHUNK_BYTES;
 	
-	/* Align to page size */
 	*diskBytes = (*diskBytes + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
 	*poolLimit = (*poolLimit + ZRAM_CHUNK_BYTES - 1) & ~(ZRAM_CHUNK_BYTES - 1);
 }
@@ -226,7 +227,6 @@ extern "C" status_t swap_file_add(const char* path)
 	if (!path)
 		return B_BAD_VALUE;
 	
-	/* Check if already exists */
 	if (swap_file_find_by_path(path))
 		return B_NAME_IN_USE;
 	
@@ -295,21 +295,17 @@ extern "C" status_t swap_file_delete(const char* path)
 	
 	uint32_t pageCount = swap->last_slot - swap->first_slot;
 	
-	/* Remove from list */
 	mutex_lock(&sSwapFileListLock);
 	sSwapFileList.Remove(swap);
 	sSwapFileCount--;
 	mutex_unlock(&sSwapFileListLock);
 	
-	/* Update available space */
 	mutex_lock(&sAvailableSwapSpaceLock);
 	sAvailableSwapSpace -= (off_t)pageCount * B_PAGE_SIZE;
 	mutex_unlock(&sAvailableSwapSpaceLock);
 	
-	/* Destroy zram device */
 	zram_kernel_destroy(swap->zram);
 	
-	/* Free resources */
 	if (swap->bmp)
 		radix_bitmap_delete(swap->bmp);
 	if (swap->path)
@@ -320,7 +316,6 @@ extern "C" status_t swap_file_delete(const char* path)
 	return B_OK;
 }
 
-/* Zram swap read/write wrappers */
 static status_t zram_swap_read_wrapper(ZramKernelDevice* zram, uint32_t pos,
 										const void* vecs, uint32_t j,
 										uint32_t flags, size_t numBytes)
@@ -329,7 +324,6 @@ static status_t zram_swap_read_wrapper(ZramKernelDevice* zram, uint32_t pos,
 	if (!swap || !swap->zram)
 		return B_BAD_VALUE;
 	
-	/* Call kernel API */
 	generic_size_t numBytesOut = 0;
 	status_t status = zram_swap_read(swap->zram, pos, (const generic_io_vec*)vecs, 
 									 1, flags, &numBytesOut);
@@ -348,7 +342,6 @@ static status_t zram_swap_write_wrapper(ZramKernelDevice* zram, uint32_t pos,
 	status_t status = zram_swap_write(swap->zram, pos, (const generic_io_vec*)vecs,
 									  1, flags, &numBytesOut);
 	if (callback)
-		/* callback handling would go here */
 		(void)callback;
 	return status;
 }
@@ -361,41 +354,15 @@ static bool zram_kernel_can_accept_wrapper(ZramKernelDevice* zram)
 	return zram_kernel_can_accept(swap->zram);
 }
 
-/**
- * Initialize swap from driver parameters
- */
 static void swap_init_post_modules()
 {
-	/* Try to load settings - in Haiku this would use load_driver_settings */
-	/* For now, just init debug */
+	/* Initialize zram swap space */
+	/* Call swap_zram_add if configured */
+	/* Call zram_kernel_debug_init for debugging */
+	zram_kernel_debug_init();
+	dprintf("hzram: swap_file_add/delete path-based API initialized\n");
 }
 
-/**
- * Dump swap information
- */
-static void dump_swap_info()
-{
-	mutex_lock(&sSwapFileListLock);
-	kprintf("Swap files: %d, total space: %lld MB\n", sSwapFileCount, 
-			sAvailableSwapSpace / (1024 * 1024));
-	
-	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
-			swap_file* swap = it.Next();) {
-		if (swap->zram) {
-			ZramStats stats;
-			zram_kernel_get_stats(swap->zram, &stats);
-			kprintf("  %s: zram compressed=%llu original=%llu ratio=%d%%\n",
-					swap->path ? swap->path : "(unknown)",
-					stats.compr_data_size, stats.orig_data_size,
-					stats.orig_data_size ? (int)(stats.compr_data_size * 100 / stats.orig_data_size) : 0);
-		}
-	}
-	mutex_unlock(&sSwapFileListLock);
-}
-
-/**
- * Initialize with debug
- */
 static void swap_init_post_modules_debug()
 {
 	swap_init_post_modules();
@@ -405,22 +372,18 @@ static void swap_init_post_modules_debug()
 
 static void swap_init_post_modules_full()
 {
+	swap_init_post_modules();
 	swap_init_post_modules_debug();
 }
 
-/* For compatibility with existing codebase expectations */
-static status_t swap_file_add_device(ZramKernelDevice* zram, uint64_t diskBytes, uint64_t poolLimit)
+static status_t swap_file_add_device(uint64_t diskBytes, uint64_t poolLimit)
 {
-	(void)zram;
 	return swap_zram_add(diskBytes, poolLimit);
 }
 
-static status_t swap_file_delete_device(ZramKernelDevice* zram)
+static status_t swap_file_delete_device(void* path)
 {
-	if (!zram)
+	if (!path)
 		return B_BAD_VALUE;
-	swap_file* swap = swap_file_get(zram);
-	if (!swap || !swap->path)
-		return B_BAD_VALUE;
-	return swap_file_delete(swap->path);
+	return swap_file_delete((const char*)path);
 }
