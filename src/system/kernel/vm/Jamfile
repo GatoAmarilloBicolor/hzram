@@ -1,0 +1,9 @@
+SubDir HAIKU_TOP src system kernel vm ;
+
+# Include zram subdirectory and merge its objects
+SubInclude HAIKU_TOP src system kernel vm zram ;
+
+# Merge zram objects into kernel_vm
+KernelMergeObject kernel_vm.o :
+	$(HAIKU_TOP)/src/system/kernel/vm/zram/zram.o
+;
