@@ -91,6 +91,22 @@ kdebug> zram
 
 ---
 
+## Licencia y Créditos
+
+Este proyecto está desarrollado bajo la licencia **BSD 3-Clause** para uso en Haiku OS y sistemas compatibles.
+
+**Créditos:**
+- **GatoAmarilloBicolor** - Desarrollador principal y maintenedor del núcleo
+- **LZ4** - Librería de compresión abierta (MIT License)
+- **Haiku OS** - Sistema operativo base (GNU Lesser General Public License v3.0)
+
+**Permisos:**
+- ✅ Uso libre para proyectos de código abierto
+- ✅ Modificación y redistribución
+- ✅ Uso en productos comerciales
+
+---
+
 ## Documentación de Diseño
 
 - `h_zram_plan_implementacion.md`: Plan maestro de implementación y verificación (T0 a T10).
