@@ -130,8 +130,11 @@ zram_reserver_pop(ZramDevice* dev)
 static void
 zram_reserver_push(ZramDevice* dev, void* span)
 {
-	if (dev->reserver.count >= dev->reserver.capacity)
+	if (dev->reserver.count >= dev->reserver.capacity) {
+		dev->ops->chunk_free(span, ZRAM_SPAN_BYTES);
+		dev->pool_bytes -= ZRAM_SPAN_BYTES;
 		return;
+	}
 	dev->reserver.spans[dev->reserver.count++] = span;
 	dev->reserver_count = dev->reserver.count;
 }
@@ -145,19 +148,14 @@ zram_class_alloc(ZramDevice* dev, uint32_t c)
 	if (dev->classes[c].free_list == NULL) {
 		dev->ops->mutex_lock(dev->reserver_lock);
 		void* span = zram_reserver_pop(dev);
-		uint32_t remaining = dev->reserver.count;
-		dev->ops->mutex_unlock(dev->reserver_lock);
-
 		if (span == NULL) {
 			dev->ops->request_refill(dev->ops->user);
-			dev->ops->mutex_lock(dev->reserver_lock);
 			span = zram_reserver_pop(dev);
-			dev->ops->mutex_unlock(dev->reserver_lock);
-			if (span == NULL)
-				return NULL;
-		} else if (remaining < 2) {
-			dev->ops->request_refill(dev->ops->user);
 		}
+		dev->ops->mutex_unlock(dev->reserver_lock);
+		
+		if (span == NULL)
+			return NULL;
 		zram_carve_span(dev, span, c);
 	}
 
@@ -177,6 +175,16 @@ zram_class_free(ZramDevice* dev, uint32_t c, void* obj)
 	dev->classes[c].free_list = obj;
 	dev->classes[c].free_count++;
 	dev->classes[c].live_count--;
+	
+	/* If class is empty and we have spare spans, return one to reserver */
+	if (dev->classes[c].live_count == 0 && dev->classes[c].free_count >= ZRAM_SPAN_BYTES / kZramClassSize[c]) {
+		dev->ops->mutex_lock(dev->reserver_lock);
+		void* span = dev->classes[c].free_list;
+		dev->classes[c].free_list = *(void**)span;
+		dev->classes[c].free_count -= ZRAM_SPAN_BYTES / kZramClassSize[c];
+		zram_reserver_push(dev, span);
+		dev->ops->mutex_unlock(dev->reserver_lock);
+	}
 }
 
 
@@ -510,12 +518,16 @@ zram_free_slots(ZramDevice* dev, uint32_t first, uint32_t count)
 			s->data = NULL;
 			dev->frees++;
 
-			dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
-
 			if (viejo.state == ZRAM_RAW || viejo.state == ZRAM_LZ4) {
-				dev->ops->mutex_lock(dev->class_mutexes[viejo.cls]);
-				zram_class_free(dev, viejo.cls, viejo.data);
-				dev->ops->mutex_unlock(dev->class_mutexes[viejo.cls]);
+				void* old_data = viejo.data;
+				uint8_t old_cls = viejo.cls;
+				dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
+				
+				dev->ops->mutex_lock(dev->class_mutexes[old_cls]);
+				zram_class_free(dev, old_cls, old_data);
+				dev->ops->mutex_unlock(dev->class_mutexes[old_cls]);
+			} else {
+				dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
 			}
 		} else {
 			dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
@@ -618,6 +630,10 @@ zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops, ZramDevice** _out
 
 	/* Primera reposición síncrona: la reserva nace llena. */
 	zram_refill(dev);
+	if (dev->reserver.count == 0) {
+		zram_destroy(dev);
+		return ZRAM_E_NOMEM;
+	}
 
 	dev->destroyed = false;
 	*_out = dev;

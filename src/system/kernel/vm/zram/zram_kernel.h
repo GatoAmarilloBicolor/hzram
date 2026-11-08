@@ -14,10 +14,10 @@
 #include "zram_core.h"
 
 /*
- * swap_addr_t se define en VMAnonymousCache.h; lo referenciamos sin
- * duplicar la definición para no romper el tipo real de Haiku.
+ * swap_addr_t is defined in Haiku's VMAnonymousCache.h.
+ * For standalone builds, we define it here to avoid dependency.
  */
-#include "../VMAnonymousCache.h"
+typedef uint32_t swap_addr_t;
 
 #ifdef __cplusplus
 extern "C" {

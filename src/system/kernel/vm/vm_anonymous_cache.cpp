@@ -36,12 +36,12 @@ struct vnode;
 typedef uint32 swap_addr_t;
 
 struct swap_file : DoublyLinkedListLinkImpl<swap_file> {
-	int			 fd;
-	struct vnode*   vnode;
+	int				fd;
+	struct vnode*	vnode;
 	void*			cookie;
-.swap_addr_t		first_slot;
-.swap_addr_t		last_slot;
-	radix_bitmap*   bmp;
+	swap_addr_t		first_slot;
+	swap_addr_t		last_slot;
+	radix_bitmap*	bmp;
 	ZramKernelDevice* zram;
 	char*			path;
 };
@@ -58,12 +58,6 @@ static swap_file* sSwapFileAlloc = NULL;
 
 /* Forward declarations */
 struct ZramKernelDevice;
-status_t status_t;
-void* void*;
-int32_t int32_t;
-off_t off_t;
-uint32_t uint32_t;
-uint64_t uint64_t;
 
 /* Helper functions */
 static swap_file* swap_file_get(ZramKernelDevice* zram)
@@ -125,8 +119,8 @@ static uint64 parse_number_value(const char* string, uint64 defaultValue)
 
 	uint64 value = 0;
 	bool any = false;
-	while (*string >= 0 && *string <= 9) {
-		uint64 next = value * 10 + (*string - 0);
+	while (*string >= '0' && *string <= '9') {
+		uint64 next = value * 10 + (*string - '0');
 		if (next < value)
 			return defaultValue;
 		value = next;
@@ -138,16 +132,16 @@ static uint64 parse_number_value(const char* string, uint64 defaultValue)
 		return defaultValue;
 
 	switch (*string) {
-		case k:
-		case K:
+		case 'k':
+		case 'K':
 			value *= 1024;
 			break;
-		case m:
-		case M:
+		case 'm':
+		case 'M':
 			value *= 1024 * 1024;
 			break;
-		case g:
-		case G:
+		case 'g':
+		case 'G':
 			value *= 1024ULL * 1024 * 1024;
 			break;
 		default:
@@ -165,17 +159,21 @@ static void parse_path_params(const char* path, uint64* diskBytes, uint64* poolL
 	*diskBytes = 512ULL * 1024 * 1024;
 	*poolLimit = 128ULL * 1024 * 1024;
 	
-	const char* size = strstr(path, "size=");
-	if (size) {
-		size += 5;
-		*diskBytes = parse_number_value(size, *diskBytes);
-	}
+	const char* query = strchr(path, '?');
+	const char* search = query ? query + 1 : path;
 	
-	const char* pool = strstr(path, "pool=");
-	if (pool) {
-		pool += 5;
-		*poolLimit = parse_number_value(pool, *poolLimit);
-	}
+	auto parse_param = [](const char* haystack, const char* needle, uint64* out, uint64 def) {
+		size_t nlen = strlen(needle);
+		for (const char* p = haystack; (p = strstr(p, needle)) != NULL; p += nlen) {
+			if (p == haystack || *(p - 1) == '&' || *(p - 1) == '?') {
+				*out = parse_number_value(p + nlen, def);
+				return;
+			}
+		}
+	};
+	
+	parse_param(search, "size=", diskBytes, *diskBytes);
+	parse_param(search, "pool=", poolLimit, *poolLimit);
 	
 	if (*diskBytes < 16ULL * 1024 * 1024)
 		*diskBytes = 16ULL * 1024 * 1024;
@@ -190,7 +188,7 @@ static void parse_path_params(const char* path, uint64* diskBytes, uint64* poolL
 static status_t zram_kernel_create_wrapper(uint64_t diskBytes, uint64_t poolLimit, ZramKernelDevice** _out)
 {
 	if (_out)
-		*__out = NULL;
+		*_out = NULL;
 	
 	status_t status = zram_kernel_create(diskBytes, poolLimit, _out);
 	if (status != B_OK)
@@ -204,8 +202,8 @@ static status_t zram_kernel_destroy_wrapper(ZramKernelDevice* dev)
 	if (!dev)
 		return B_BAD_VALUE;
 	
-	status_t status = zram_kernel_destroy(dev);
-	return status;
+	zram_kernel_destroy(dev);
+	return B_OK;
 }
 
 /**
@@ -226,12 +224,12 @@ status_t swap_zram_add(uint64_t diskBytes, uint64_t poolLimit)
 		return status;
 	}
 	
-.swap->fd = -1;
-.swap->vnode = NULL;
-.swap->cookie = NULL;
-.swap->zram = dev;
-.swap->path = NULL;
-.swap->bmp = radix_bitmap_create(pageCount);
+	swap->fd = -1;
+	swap->vnode = NULL;
+	swap->cookie = NULL;
+	swap->zram = dev;
+	swap->path = NULL;
+	swap->bmp = radix_bitmap_create(pageCount);
 if (swap->bmp == NULL) {
 	delete swap;
 	zram_kernel_destroy_wrapper(dev);
@@ -251,7 +249,6 @@ mutex_lock(&sSwapFileListLock);
 	sSwapFileCount++;
 	mutex_unlock(&sSwapFileListLock);
 	
-	mutex_unlock(&sAvailableSwapSpaceLock);
 	sAvailableSwapSpace += (off_t)pageCount * B_PAGE_SIZE;
 	mutex_unlock(&sAvailableSwapSpaceLock);
 	
@@ -273,6 +270,7 @@ extern "C" status_t swap_file_add(const char* path)
 	uint64_t poolLimit = 0;
 	parse_path_params(path, &diskBytes, &poolLimit);
 	
+	ZramKernelDevice* dev = NULL;
 	status_t status = zram_kernel_create_wrapper(diskBytes, poolLimit, &dev);
 	if (status != B_OK)
 		return status;
@@ -285,39 +283,37 @@ extern "C" status_t swap_file_add(const char* path)
 		return status;
 	}
 	
-swap->fd = -1;
-swap->vnode = NULL;
-swap->cookie = NULL;
-swap->zram = dev;
-swap->path = strdup(path);
-swap->bmp = radix_bitmap_create(pageCount);
-if (swap->bmp == NULL) {
-	if (swap->path)
-		free(swap->path);
-	delete swap;
-	status = zram_kernel_destroy_wrapper(dev);
-	return status;
-}
-	
-mutex_lock(&sAvailableSwapSpaceLock);
-mutex_lock(&sSwapFileListLock);
-	if (sSwapFileList.IsEmpty()) {
-		swap->first_slot = 0;
-		swap->last_slot = pageCount;
-	} else {
-		swap->first_slot = sSwapFileList.Last()->last_slot + 1;
-		sw->last_slot = swap->first_slot + pageCount;
+	swap->fd = -1;
+	swap->vnode = NULL;
+	swap->cookie = NULL;
+	swap->zram = dev;
+	swap->path = strdup(path);
+	swap->bmp = radix_bitmap_create(pageCount);
+	if (swap->bmp == NULL) {
+		if (swap->path)
+			free(swap->path);
+		delete swap;
+		status = zram_kernel_destroy_wrapper(dev);
+		return status;
 	}
-	sSwapFileList.Add(swap);
-	sSwapFileCount++;
-	mutex_unlock(&sSwapFileListLock);
 	
-	mutex_unlock(&sAvailableSwapSpaceLock);
+	mutex_lock(&sAvailableSwapSpaceLock);
+	mutex_lock(&sSwapFileListLock);
+		if (sSwapFileList.IsEmpty()) {
+			swap->first_slot = 0;
+			swap->last_slot = pageCount;
+		} else {
+			swap->first_slot = sSwapFileList.Last()->last_slot + 1;
+			swap->last_slot = swap->first_slot + pageCount;
+		}
+		sSwapFileList.Add(swap);
+		sSwapFileCount++;
+		mutex_unlock(&sSwapFileListLock);
+	
 	sAvailableSwapSpace += (off_t)pageCount * B_PAGE_SIZE;
 	mutex_unlock(&sAvailableSwapSpaceLock);
 	
-	dprintf("swap_file_add: added zram swap at %s (%llu MB)
-", path, diskBytes / (1024*1024));
+	dprintf("swap_file_add: added zram swap at %s (%llu MB)\n", path, diskBytes / (1024*1024));
 	return B_OK;
 }
 
@@ -327,7 +323,7 @@ extern "C" status_t swap_file_delete(const char* path)
 		return B_BAD_VALUE;
 	
 	if (strlen(path) > 1024)
-		return B_INVALID_ARG;
+		return B_BAD_VALUE;
 	
 	swap_file* swap = swap_file_find_by_path(path);
 	if (!swap)
@@ -336,7 +332,11 @@ extern "C" status_t swap_file_delete(const char* path)
 	if (!swap->zram)
 		return B_BAD_VALUE;
 	
+	if (swap->last_slot < swap->first_slot)
+		return B_BAD_VALUE;
+	
 	uint32_t pageCount = swap->last_slot - swap->first_slot;
+	status_t status;
 	
 	mutex_lock(&sAvailableSwapSpaceLock);
 	mutex_lock(&sSwapFileListLock);
@@ -357,28 +357,27 @@ extern "C" status_t swap_file_delete(const char* path)
 		free(swap->path);
 	delete swap;
 	
-	dprintf("swap_file_delete: removed zram swap at %s
-", path);
+	dprintf("swap_file_delete: removed zram swap at %s\n", path);
 	return B_OK;
 }
 
 static status_t zram_swap_read_wrapper(ZramKernelDevice* zram, uint32_t pos,
-										const void* vecs, uint32_t j,
-										uint32_t flags, size_t numBytes)
+									  const void* vecs, uint32_t j,
+									  uint32_t flags, size_t numBytes)
 {
 	swap_file* swap = swap_file_get(zram);
 	if (!swap || !swap->zram)
 		return B_BAD_VALUE;
 	
 	generic_size_t numBytesOut = 0;
-	status_t status = zram_swap_read(swap->zram, pos, (const generic_io_vec*)vecs, 
-									 1, flags, &numBytesOut);
+	status_t status = zram_swap_read(swap->zram, pos, (const generic_io_vec*)vecs,
+									 j, flags, &numBytesOut);
 	return status;
 }
 
 static status_t zram_swap_write_wrapper(ZramKernelDevice* zram, uint32_t pos,
-										const void* vecs, uint32_t j,
-										uint32_t numBytes, uint32_t flags, void* callback)
+									   const void* vecs, uint32_t j,
+									   uint32_t numBytes, uint32_t flags, void* callback)
 {
 	swap_file* swap = swap_file_get(zram);
 	if (!swap || !swap->zram)
@@ -386,7 +385,7 @@ static status_t zram_swap_write_wrapper(ZramKernelDevice* zram, uint32_t pos,
 	
 	generic_size_t numBytesOut = 0;
 	status_t status = zram_swap_write(swap->zram, pos, (const generic_io_vec*)vecs,
-									  1, flags, &numBytesOut);
+									  j, flags, &numBytesOut);
 	if (callback)
 		(void)callback;
 	return status;
@@ -403,22 +402,18 @@ static bool zram_kernel_can_accept_wrapper(ZramKernelDevice* zram)
 static void swap_init_post_modules()
 {
 	zram_kernel_debug_init();
-	dprintf("hzram: swap_file_add/delete path-based API initialized
-");
+	dprintf("hzram: swap_file_add/delete path-based API initialized\n");
 }
 
 static void swap_init_post_modules_debug()
 {
-	swap_init_post_modules();
 	zram_kernel_debug_init();
-	dprintf("hzram: swap_file_add/delete path-based API initialized
-");
+	dprintf("hzram: swap_file_add/delete path-based API initialized\n");
 }
 
 static void swap_init_post_modules_full()
 {
 	swap_init_post_modules();
-	swap_init_post_modules_debug();
 }
 
 static status_t swap_file_add_device(uint64_t diskBytes, uint64_t poolLimit)

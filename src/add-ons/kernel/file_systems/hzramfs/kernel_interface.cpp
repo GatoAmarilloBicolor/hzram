@@ -52,6 +52,7 @@ extern "C" {
 /* Kernel-internal functions, exported through kernel_versions. */
 extern "C" status_t swap_file_add(const char* path);
 extern "C" status_t swap_file_delete(const char* path);
+extern "C" status_t check_access_permissions(int mode, mode_t fileMode, gid_t fileGid, uid_t fileUid);
 
 extern fs_vnode_ops gHzramVnodeOps;
 extern fs_volume_ops gHzramVolumeOps;
@@ -138,7 +139,7 @@ round_up(uint64 value, uint64 alignment)
 static uint32
 now_seconds(void)
 {
-	return (uint32)real_time_clock();
+	return (uint32)(system_time() / 1000000);
 }
 
 
@@ -163,15 +164,21 @@ hzram_mem_free(void* pointer)
 static void*
 hzram_chunk_alloc(size_t bytes)
 {
+	mutex_lock(&sVolumeLock);
 	struct hzram_volume* volume = sVolume;
-	if (volume == NULL)
+	if (volume == NULL) {
+		mutex_unlock(&sVolumeLock);
 		return NULL;
+	}
 
-	if (volume->poolBump + bytes > volume->poolEnd)
+	if (volume->poolBump + bytes > volume->poolEnd) {
+		mutex_unlock(&sVolumeLock);
 		return NULL;
+	}
 
 	void* chunk = (void*)volume->poolBump;
 	volume->poolBump += bytes;
+	mutex_unlock(&sVolumeLock);
 	return chunk;
 }
 
@@ -505,6 +512,22 @@ hzram_volume_destroy(struct hzram_volume* volume)
 	if (volume->refillSem >= 0)
 		delete_sem(volume->refillSem);
 
+	/* Ensure swap is deactivated before destroying zram device. */
+	mutex_lock(&volume->lock);
+	if (volume->swapActive) {
+		mutex_unlock(&volume->lock);
+		
+		char path[1024];
+		status_t status = vfs_entry_ref_to_path(volume->fsVolume->id, HZRAM_ROOT_ID,
+			HZRAM_SWAP_NAME, true, path, sizeof(path));
+		if (status == B_OK)
+			swap_file_delete(path);
+		
+		mutex_lock(&volume->lock);
+		volume->swapActive = false;
+	}
+	mutex_unlock(&volume->lock);
+
 	if (volume->device != NULL)
 		zram_destroy(volume->device);
 
@@ -564,7 +587,14 @@ hzram_swap_write_pages(struct hzram_volume* volume, off_t pos,
 	if (pos < 0)
 		return B_BAD_VALUE;
 
+	mutex_lock(&volume->lock);
+	if (!volume->swapActive) {
+		mutex_unlock(&volume->lock);
+		return B_BAD_VALUE;
+	}
 	uint64 fileSize = volume->swap.size;
+	mutex_unlock(&volume->lock);
+
 	if ((uint64)pos >= fileSize)
 		return B_BAD_VALUE;
 
@@ -621,7 +651,10 @@ hzram_swap_write_pages(struct hzram_volume* volume, off_t pos,
 	}
 
 	zram_ctx_put(volume->device, context);
+	
+	mutex_lock(&volume->lock);
 	volume->swap.mtime = now_seconds();
+	mutex_unlock(&volume->lock);
 
 	if (_numBytes != NULL)
 		*_numBytes = total;
@@ -636,7 +669,14 @@ hzram_swap_read_pages(struct hzram_volume* volume, off_t pos,
 	if (pos < 0)
 		return B_BAD_VALUE;
 
+	mutex_lock(&volume->lock);
+	if (!volume->swapActive) {
+		mutex_unlock(&volume->lock);
+		return B_BAD_VALUE;
+	}
 	uint64 fileSize = volume->swap.size;
+	mutex_unlock(&volume->lock);
+
 	if ((uint64)pos >= fileSize)
 		return B_BAD_VALUE;
 

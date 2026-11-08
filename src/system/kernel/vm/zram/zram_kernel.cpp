@@ -19,6 +19,7 @@
 #include <thread.h>
 #include <vfs.h>
 #include <vm/vm.h>
+#include <SupportDefs.h>	/* atomic_add */
 
 /*
  * ============================================================================
@@ -31,6 +32,7 @@ struct ZramKernelDevice {
 	void*				pool_base;
 	void*				pool_end;
 	void*				pool_bump;
+	void*				pool_lock;
 	area_id				pool_area;
 	uint64_t			disk_bytes;
 	uint64_t			pool_limit;
@@ -39,10 +41,11 @@ struct ZramKernelDevice {
 	volatile bool		refill_done;
 	ZramPlatformOps		ops;
 	ZramKernelDevice*	next;
+	volatile int32_t	ref_count;
 };
 
-static ZramKernelDevice* g_kernel_device = NULL;
 static ZramKernelDevice* g_kernel_devices = NULL;
+static void* g_devices_lock = NULL;
 
 /*
  * ============================================================================
@@ -67,15 +70,19 @@ kern_mem_free(void* ptr)
 static void*
 kern_chunk_alloc(size_t bytes)
 {
-	ZramKernelDevice* dev = g_kernel_device;
+	ZramKernelDevice* dev = (ZramKernelDevice*)g_platform_ops.user;
 	if (dev == NULL)
 		return NULL;
 
-	if ((uint8_t*)dev->pool_bump + bytes > (uint8_t*)dev->pool_end)
+	mutex_lock((mutex*)dev->pool_lock);
+	if ((uint8_t*)dev->pool_bump + bytes > (uint8_t*)dev->pool_end) {
+		mutex_unlock((mutex*)dev->pool_lock);
 		return NULL;
+	}
 
 	void* chunk = dev->pool_bump;
 	dev->pool_bump = (uint8_t*)chunk + bytes;
+	mutex_unlock((mutex*)dev->pool_lock);
 	return chunk;
 }
 
@@ -174,8 +181,6 @@ static void
 kern_request_refill(void* user)
 {
 	ZramKernelDevice* dev = (ZramKernelDevice*)user;
-	if (dev == NULL)
-		dev = g_kernel_device;
 	if (dev != NULL && dev->refill_sem >= 0)
 		release_sem(dev->refill_sem);
 }
@@ -209,6 +214,7 @@ static status_t
 zram_refill_thread(void* data)
 {
 	ZramKernelDevice* dev = (ZramKernelDevice*)data;
+	atomic_add(&dev->ref_count, 1);
 
 	while (!dev->refill_done) {
 		acquire_sem(dev->refill_sem);
@@ -217,6 +223,7 @@ zram_refill_thread(void* data)
 		zram_refill(dev->core);
 	}
 
+	zram_kernel_dev_put(dev);
 	return B_OK;
 }
 
@@ -244,6 +251,7 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 		return B_NO_MEMORY;
 	memset(dev, 0, sizeof(*dev));
 	dev->pool_area = -1;
+	dev->ref_count = 1;
 
 	/* Reserva completa del pool: memoria cableada y no bloqueante. */
 	void* pool = NULL;
@@ -260,10 +268,19 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 	dev->pool_bump = pool;
 	dev->disk_bytes = diskBytes;
 	dev->pool_limit = poolLimit;
-	g_kernel_device = dev;
+
+	dev->pool_lock = malloc(sizeof(mutex));
+	if (dev->pool_lock == NULL) {
+		delete_area(area);
+		free(dev);
+		return B_NO_MEMORY;
+	}
+	mutex_init((mutex*)dev->pool_lock, "zram pool");
 
 	dev->refill_sem = create_sem(0, "zram_refill");
 	if (dev->refill_sem < 0) {
+		mutex_destroy((mutex*)dev->pool_lock);
+		free(dev->pool_lock);
 		delete_area(area);
 		free(dev);
 		return B_NO_MEMORY;
@@ -277,6 +294,8 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 	int rc = zram_create(&cfg, &dev->ops, &dev->core);
 	if (rc != 0) {
 		delete_sem(dev->refill_sem);
+		mutex_destroy((mutex*)dev->pool_lock);
+		free(dev->pool_lock);
 		delete_area(area);
 		free(dev);
 		return B_NO_MEMORY;
@@ -287,40 +306,43 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 	if (dev->refill_thread < 0) {
 		delete_sem(dev->refill_sem);
 		zram_destroy(dev->core);
+		mutex_destroy((mutex*)dev->pool_lock);
+		free(dev->pool_lock);
 		delete_area(area);
 		free(dev);
 		return B_NO_MEMORY;
 	}
 	resume_thread(dev->refill_thread);
 
-	dev->next = g_kernel_devices;
-	g_kernel_devices = dev;
+	/* Add to global list for KDL debugging */
+	if (g_devices_lock == NULL) {
+		g_devices_lock = malloc(sizeof(mutex));
+		if (g_devices_lock) {
+			mutex_init((mutex*)g_devices_lock, "zram devices");
+		}
+	}
+	if (g_devices_lock) {
+		mutex_lock((mutex*)g_devices_lock);
+		dev->next = g_kernel_devices;
+		g_kernel_devices = dev;
+		mutex_unlock((mutex*)g_devices_lock);
+	}
 
 	*_out = dev;
 	return B_OK;
 }
 
 
-void
-zram_kernel_destroy(ZramKernelDevice* dev)
+static void
+zram_kernel_dev_put(ZramKernelDevice* dev)
 {
 	if (dev == NULL)
 		return;
-
-	/* Desenlazar de la lista global */
-	if (g_kernel_devices == dev) {
-		g_kernel_devices = dev->next;
-	} else {
-		for (ZramKernelDevice* d = g_kernel_devices; d != NULL; d = d->next) {
-			if (d->next == dev) {
-				d->next = dev->next;
-				break;
-			}
-		}
-	}
-	if (g_kernel_device == dev)
-		g_kernel_device = g_kernel_devices;
-
+	
+	if (atomic_add(&dev->ref_count, -1) > 1)
+		return;
+	
+	/* Last reference - safe to destroy */
 	dev->refill_done = true;
 	if (dev->refill_sem >= 0)
 		release_sem(dev->refill_sem);
@@ -339,7 +361,33 @@ zram_kernel_destroy(ZramKernelDevice* dev)
 	if (dev->pool_area >= 0)
 		delete_area(dev->pool_area);
 
+	if (dev->pool_lock != NULL) {
+		mutex_destroy((mutex*)dev->pool_lock);
+		free(dev->pool_lock);
+	}
+
+	if (g_devices_lock) {
+		mutex_lock((mutex*)g_devices_lock);
+		if (g_kernel_devices == dev) {
+			g_kernel_devices = dev->next;
+		} else {
+			for (ZramKernelDevice* d = g_kernel_devices; d != NULL; d = d->next) {
+				if (d->next == dev) {
+					d->next = dev->next;
+					break;
+				}
+			}
+		}
+		mutex_unlock((mutex*)g_devices_lock);
+	}
+
 	free(dev);
+}
+
+void
+zram_kernel_destroy(ZramKernelDevice* dev)
+{
+	zram_kernel_dev_put(dev);
 }
 
 /*
@@ -369,9 +417,13 @@ zram_swap_write(ZramKernelDevice* dev, off_t pos,
 	if (vecs == NULL || pos < 0 || pos % B_PAGE_SIZE != 0)
 		return B_BAD_VALUE;
 
+	atomic_add(&dev->ref_count, 1);
+	
 	ZramCtx* ctx = zram_ctx_get(dev->core);
-	if (ctx == NULL)
+	if (ctx == NULL) {
+		zram_kernel_dev_put(dev);
 		return B_NO_MEMORY;
+	}
 
 	bool physical = zram_is_physical(flags);
 	uint32_t slot = (uint32_t)(pos / B_PAGE_SIZE);
@@ -380,6 +432,7 @@ zram_swap_write(ZramKernelDevice* dev, off_t pos,
 	for (uint32_t i = 0; i < count; i++) {
 		if (vecs[i].length % B_PAGE_SIZE != 0) {
 			zram_ctx_put(dev->core, ctx);
+			zram_kernel_dev_put(dev);
 			return B_BAD_VALUE;
 		}
 
@@ -395,6 +448,7 @@ zram_swap_write(ZramKernelDevice* dev, off_t pos,
 			int rc = zram_write_page(dev->core, ctx, slot, src);
 			if (rc != ZRAM_OK) {
 				zram_ctx_put(dev->core, ctx);
+				zram_kernel_dev_put(dev);
 				return rc == ZRAM_E_NOMEM ? B_NO_MEMORY : B_ERROR;
 			}
 
@@ -406,6 +460,8 @@ zram_swap_write(ZramKernelDevice* dev, off_t pos,
 	zram_ctx_put(dev->core, ctx);
 	if (_numBytes != NULL)
 		*_numBytes = total;
+	
+	zram_kernel_dev_put(dev);
 	return B_OK;
 }
 
@@ -424,9 +480,13 @@ zram_swap_read(ZramKernelDevice* dev, off_t pos,
 	if (vecs == NULL || pos < 0 || pos % B_PAGE_SIZE != 0)
 		return B_BAD_VALUE;
 
+	atomic_add(&dev->ref_count, 1);
+	
 	ZramCtx* ctx = zram_ctx_get(dev->core);
-	if (ctx == NULL)
+	if (ctx == NULL) {
+		zram_kernel_dev_put(dev);
 		return B_NO_MEMORY;
+	}
 
 	bool physical = zram_is_physical(flags);
 	uint32_t slot = (uint32_t)(pos / B_PAGE_SIZE);
@@ -435,6 +495,7 @@ zram_swap_read(ZramKernelDevice* dev, off_t pos,
 	for (uint32_t i = 0; i < count; i++) {
 		if (vecs[i].length % B_PAGE_SIZE != 0) {
 			zram_ctx_put(dev->core, ctx);
+			zram_kernel_dev_put(dev);
 			return B_BAD_VALUE;
 		}
 
@@ -445,9 +506,10 @@ zram_swap_read(ZramKernelDevice* dev, off_t pos,
 			if (physical)
 				read_dst = zram_ctx_page(ctx);
 
-			int rc = zram_read_page(dev->core, slot, read_dst);
+			int rc = zram_read_page(dev->core, ctx, slot, read_dst);
 			if (rc != ZRAM_OK) {
 				zram_ctx_put(dev->core, ctx);
+				zram_kernel_dev_put(dev);
 				return B_ERROR;
 			}
 
@@ -464,6 +526,8 @@ zram_swap_read(ZramKernelDevice* dev, off_t pos,
 	zram_ctx_put(dev->core, ctx);
 	if (_numBytes != NULL)
 		*_numBytes = total;
+	
+	zram_kernel_dev_put(dev);
 	return B_OK;
 }
 
@@ -520,6 +584,10 @@ zram_debug_command(int argc, char** argv)
 	(void)argc;
 	(void)argv;
 
+	if (g_devices_lock == NULL)
+		return 0;
+
+	mutex_lock((mutex*)g_devices_lock);
 	for (ZramKernelDevice* dev = g_kernel_devices; dev != NULL;
 			dev = dev->next) {
 		ZramStats st;
@@ -532,9 +600,7 @@ zram_debug_command(int argc, char** argv)
 	kprintf("  Configuration:\n");
 	kprintf("    disk_bytes:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu64 " slots)\n",
 		dev->disk_bytes, dev->disk_bytes / (1024 * 1024), totalPages);
-	kprintf("    compression:         %" B_PRIu32 "%% saved (%" B_PRIu64 " bytes saved)\n",
-		stats.compression_ratio, stats.compr_bytes, stats.compr_bytes);
-		kprintf("    pool_limit:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu32 " chunks)\n",
+	kprintf("    pool_limit:         %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu32 " chunks)\n",
 			dev->pool_limit, dev->pool_limit / (1024 * 1024), st.chunk_capacity);
 		kprintf("    pool_allocated:     %" B_PRIu64 " B (%" B_PRIu64 " MB, %" B_PRIu32 " chunks)\n",
 			st.pool_bytes, st.pool_bytes / (1024 * 1024), st.chunk_count);
@@ -585,6 +651,7 @@ zram_debug_command(int argc, char** argv)
 		kprintf("    read_corrupt:       %" B_PRIu64 "\n", st.read_corrupt);
 		kprintf("    read_empty:         %" B_PRIu64 "\n", st.read_empty);
 	}
+	mutex_unlock((mutex*)g_devices_lock);
 
 	return 0;
 }
