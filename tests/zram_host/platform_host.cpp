@@ -73,8 +73,9 @@ host_mem_free(void* ptr)
  */
 
 static void*
-host_chunk_alloc(size_t bytes)
+host_chunk_alloc(void* user, size_t bytes)
 {
+	(void)user;
 	if (g_fail_chunk_alloc)
 		return nullptr;
 
@@ -95,8 +96,9 @@ host_chunk_alloc(size_t bytes)
 
 
 static void
-host_chunk_free(void* ptr, size_t bytes)
+host_chunk_free(void* user, void* ptr, size_t bytes)
 {
+	(void)user;
 	if (ptr != nullptr) {
 		g_alloc_count--;
 		g_alloc_bytes -= (int64_t)bytes;
@@ -236,6 +238,7 @@ host_request_refill(void* user)
 	if (dev != nullptr)
 		zram_refill(dev);
 }
+
 
 /*
  * ============================================================================

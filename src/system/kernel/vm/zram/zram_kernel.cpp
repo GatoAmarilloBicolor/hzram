@@ -14,12 +14,12 @@
 #include <device_manager/IORequest.h>	/* B_PHYSICAL_IO_REQUEST */
 #include <lock.h>
 #include <smp.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <thread.h>
 #include <vfs.h>
 #include <vm/vm.h>
-#include <SupportDefs.h>	/* atomic_add */
 
 /*
  * ============================================================================
@@ -41,7 +41,7 @@ struct ZramKernelDevice {
 	volatile bool		refill_done;
 	ZramPlatformOps		ops;
 	ZramKernelDevice*	next;
-	volatile int32_t	ref_count;
+	_Atomic int32_t		ref_count;
 };
 
 static ZramKernelDevice* g_kernel_devices = NULL;
@@ -68,9 +68,9 @@ kern_mem_free(void* ptr)
 
 
 static void*
-kern_chunk_alloc(size_t bytes)
+kern_chunk_alloc(void* user, size_t bytes)
 {
-	ZramKernelDevice* dev = (ZramKernelDevice*)g_platform_ops.user;
+	ZramKernelDevice* dev = (ZramKernelDevice*)user;
 	if (dev == NULL)
 		return NULL;
 
@@ -88,8 +88,9 @@ kern_chunk_alloc(size_t bytes)
 
 
 static void
-kern_chunk_free(void* ptr, size_t bytes)
+kern_chunk_free(void* user, void* ptr, size_t bytes)
 {
+	(void)user;
 	(void)ptr;
 	(void)bytes;
 }
@@ -214,7 +215,7 @@ static status_t
 zram_refill_thread(void* data)
 {
 	ZramKernelDevice* dev = (ZramKernelDevice*)data;
-	atomic_add(&dev->ref_count, 1);
+	zram_kernel_dev_get(dev);
 
 	while (!dev->refill_done) {
 		acquire_sem(dev->refill_sem);
@@ -290,7 +291,7 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 	dev->ops = g_platform_ops;
 	dev->ops.user = dev;
 
-	ZramConfig cfg = { diskBytes, poolLimit };
+	ZramConfig cfg = { diskBytes, poolLimit, ZRAM_ENGINE_AUTO };
 	int rc = zram_create(&cfg, &dev->ops, &dev->core);
 	if (rc != 0) {
 		delete_sem(dev->refill_sem);
@@ -333,16 +334,23 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 }
 
 
+static inline void
+zram_kernel_dev_get(ZramKernelDevice* dev)
+{
+	atomic_fetch_add_explicit(&dev->ref_count, 1, memory_order_acquire);
+}
+
 static void
 zram_kernel_dev_put(ZramKernelDevice* dev)
 {
 	if (dev == NULL)
 		return;
 	
-	if (atomic_add(&dev->ref_count, -1) > 1)
+	if (atomic_fetch_sub_explicit(&dev->ref_count, 1, memory_order_release) > 1)
 		return;
 	
 	/* Last reference - safe to destroy */
+	atomic_thread_fence(memory_order_acquire);
 	dev->refill_done = true;
 	if (dev->refill_sem >= 0)
 		release_sem(dev->refill_sem);
@@ -387,6 +395,14 @@ zram_kernel_dev_put(ZramKernelDevice* dev)
 void
 zram_kernel_destroy(ZramKernelDevice* dev)
 {
+	if (dev == NULL)
+		return;
+
+	/* C-002: Wait for all references to drop before destroying */
+	while (atomic_load_explicit(&dev->ref_count, memory_order_acquire) > 0) {
+		snooze(1000); /* 1ms */
+	}
+
 	zram_kernel_dev_put(dev);
 }
 
@@ -417,7 +433,7 @@ zram_swap_write(ZramKernelDevice* dev, off_t pos,
 	if (vecs == NULL || pos < 0 || pos % B_PAGE_SIZE != 0)
 		return B_BAD_VALUE;
 
-	atomic_add(&dev->ref_count, 1);
+	zram_kernel_dev_get(dev);
 	
 	ZramCtx* ctx = zram_ctx_get(dev->core);
 	if (ctx == NULL) {
@@ -480,7 +496,7 @@ zram_swap_read(ZramKernelDevice* dev, off_t pos,
 	if (vecs == NULL || pos < 0 || pos % B_PAGE_SIZE != 0)
 		return B_BAD_VALUE;
 
-	atomic_add(&dev->ref_count, 1);
+	zram_kernel_dev_get(dev);
 	
 	ZramCtx* ctx = zram_ctx_get(dev->core);
 	if (ctx == NULL) {
@@ -571,6 +587,146 @@ zram_kernel_check_invariants(ZramKernelDevice* dev)
 		return false;
 	return zram_check_invariants(dev->core);
 }
+
+
+/*
+ * ============================================================================
+ * ESTADÍSTICAS FORMATO POSIX (kernel-safe: usa kprintf)
+ * ============================================================================
+ */
+
+static void
+zram_kernel_fmt_bytes(char* buf, size_t size, uint64_t bytes)
+{
+	const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+	int unit = 0;
+	double val = (double)bytes;
+	while (val >= 1024.0 && unit < 4) {
+		val /= 1024.0;
+		unit++;
+	}
+	snprintf(buf, size, "%.2f %s", val, units[unit]);
+}
+
+static uint32_t
+zram_kernel_calc_ratio(uint64_t orig, uint64_t stored)
+{
+	if (stored == 0)
+		return orig > 0 ? 10000 : 100;
+	return (uint32_t)((orig * 100) / stored);
+}
+
+int
+zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size)
+{
+	if (dev == NULL || buf == NULL || size == 0)
+		return -1;
+
+	ZramStats st;
+	zram_get_stats(dev->core, &st);
+
+	ZramConfig cfg = {
+		.disk_bytes = dev->disk_bytes,
+		.pool_limit = dev->pool_limit,
+	};
+
+	/* Format config values first */
+	char disk_size_buf[32];
+	char pool_limit_buf[32];
+	zram_kernel_fmt_bytes(disk_size_buf, sizeof(disk_size_buf), cfg.disk_bytes);
+	zram_kernel_fmt_bytes(pool_limit_buf, sizeof(pool_limit_buf), cfg.pool_limit);
+
+	/* Format aggregate values */
+	char orig_buf[32], stored_buf[32], pool_buf[32];
+	zram_kernel_fmt_bytes(orig_buf, sizeof(orig_buf), st.orig_bytes);
+	zram_kernel_fmt_bytes(stored_buf, sizeof(stored_buf), st.stored_bytes);
+	zram_kernel_fmt_bytes(pool_buf, sizeof(pool_buf), st.pool_bytes);
+
+	/* Format dynamic values */
+	char same_saved_buf[32];
+	zram_kernel_fmt_bytes(same_saved_buf, sizeof(same_saved_buf), st.pages_same * B_PAGE_SIZE);
+
+	char lz4_stored_buf[32] = "0 B";
+	uint32_t lz4_ratio = 100;
+	if (st.pages_lz4 > 0) {
+		uint64_t lz4_stored = st.stored_bytes - st.pages_raw * B_PAGE_SIZE;
+		zram_kernel_fmt_bytes(lz4_stored_buf, sizeof(lz4_stored_buf), lz4_stored);
+		lz4_ratio = zram_kernel_calc_ratio(st.pages_lz4 * B_PAGE_SIZE, lz4_stored);
+	}
+
+	char raw_stored_buf[32];
+	zram_kernel_fmt_bytes(raw_stored_buf, sizeof(raw_stored_buf), st.pages_raw * B_PAGE_SIZE);
+
+	uint64_t total_pages = st.pages_same + st.pages_raw + st.pages_lz4 + st.pages_empty;
+	uint64_t active_pages = st.pages_same + st.pages_raw + st.pages_lz4;
+	uint32_t ratio = zram_kernel_calc_ratio(st.orig_bytes, st.stored_bytes);
+
+	double same_pct = active_pages > 0 ? (double)st.pages_same * 100.0 / active_pages : 0.0;
+	double lz4_pct = active_pages > 0 ? (double)st.pages_lz4 * 100.0 / active_pages : 0.0;
+	double raw_pct = active_pages > 0 ? (double)st.pages_raw * 100.0 / active_pages : 0.0;
+	double active_pct = total_pages > 0 ? (double)active_pages * 100.0 / total_pages : 0.0;
+
+	int len = snprintf(buf, size,
+		"zram_stats:\n"
+		"  config:\n"
+		"    disk_size:        %s\n"
+		"    pool_limit:       %s\n"
+		"  pages:\n"
+		"    total_slots:      %" PRIu64 "\n"
+		"    active_pages:     %" PRIu64 " (%.2f%%)\n"
+		"    empty_pages:      %" PRIu64 "\n"
+		"  compression_layers:\n"
+		"    SAME (identical): %" PRIu64 " pages (%5.2f%%)  ratio: %u%%  saved: %s\n"
+		"    LZ4  (compressed): %" PRIu64 " pages (%5.2f%%)  ratio: %u%%  stored: %s\n"
+		"    RAW  (incompress): %" PRIu64 " pages (%5.2f%%)  ratio: 100%%  stored: %s\n"
+		"  aggregate:\n"
+		"    orig_bytes:       %s\n"
+		"    stored_bytes:     %s\n"
+		"    compression_ratio: %u.%02u%%\n"
+		"    pool_allocated:   %s\n"
+		"  class_distribution:\n",
+		disk_size_buf, pool_limit_buf,
+		total_pages,
+		active_pages, active_pct,
+		st.pages_empty,
+		st.pages_same, same_pct, ratio, same_saved_buf,
+		st.pages_lz4, lz4_pct, lz4_ratio, lz4_stored_buf,
+		st.pages_raw, raw_pct, raw_stored_buf,
+		orig_buf, stored_buf, ratio / 100, ratio % 100, pool_buf);
+
+	/* Append class distribution */
+	for (uint32_t c = 0; c < ZRAM_CLASS_COUNT && len < (int)size; c++) {
+		if (st.class_live[c] > 0 || st.class_free[c] > 0) {
+			len += snprintf(buf + len, size - len,
+				"    class %2u (%4u B): live=%5u free=%5u\n",
+				c, kZramClassSize[c], st.class_live[c], st.class_free[c]);
+		}
+	}
+
+	if (len < (int)size) {
+		snprintf(buf + len, size - len,
+			"  reserver: spans=%u/%u\n",
+			st.reserver_count, st.reserver_capacity);
+	}
+
+	return len;
+}
+
+int
+zram_kernel_stats_kprintf(ZramKernelDevice* dev)
+{
+	if (dev == NULL)
+		return -1;
+
+	char buf[2048];
+	int len = zram_kernel_stats_snprintf(dev, buf, sizeof(buf));
+	if (len < 0)
+		return -1;
+
+	kprintf("%s", buf);
+	return len;
+}
+
 
 /*
  * ============================================================================

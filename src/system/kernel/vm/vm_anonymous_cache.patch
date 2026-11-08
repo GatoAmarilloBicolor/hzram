@@ -1,0 +1,165 @@
+diff --git a/src/system/kernel/vm/VMAnonymousCache.cpp b/src/system/kernel/vm/VMAnonymousCache.cpp
+--- a/src/system/kernel/vm/VMAnonymousCache.cpp
++++ b/src/system/kernel/vm/VMAnonymousCache.cpp
+@@ -1,6 +1,8 @@
+ // VMAnonymousCache.cpp
+ 
+ #include "VMAnonymousCache.h"
++#include "zram/zram_kernel.h"   // API de la capa 2
+ 
+ // ... existing includes ...
+ 
+@@ swap_file struct definition:
+ struct swap_file : DoublyLinkedListLinkImpl<swap_file> {
+     int             fd;
+     struct vnode*   vnode;
+     void*           cookie;
+     swap_addr_t     first_slot;
+     swap_addr_t     last_slot;
+     radix_bitmap*   bmp;
++    struct ZramKernelDevice* zram;
+ };
+ 
+@@ swap_file_add():
+     // ... existing swap creation ...
++    swap->zram = NULL;
+ 
+@@ swap_slot_alloc():
+     mutex_lock(&sSwapFileListLock);
++
++    for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
++            swap_file* f = it.Next();) {
++        if (f->zram == NULL || !zram_kernel_can_accept(f->zram))
++            continue;
++        swap_addr_t a = radix_bitmap_alloc(f->bmp, count);
++        if (a != SWAP_SLOT_NONE) {
++            mutex_unlock(&sSwapFileListLock);
++            return a + f->first_slot;
++        }
++    }
++
+     // ... existing round-robin loop ...
+     // after selecting sSwapFileAlloc:
++    if (sSwapFileAlloc->zram != NULL
++            && !zram_kernel_can_accept(sSwapFileAlloc->zram)) {
++        sSwapFileAlloc = sSwapFileList.GetNext(sSwapFileAlloc);
++        continue;
++    }
+ 
+@@ swap_slot_dealloc():
+     slotIndex -= swapFile->first_slot;
++    if (swapFile->zram != NULL)
++        zram_kernel_free(swapFile->zram, slotIndex, count);
+     radix_bitmap_dealloc(...);
+ 
+@@ VMAnonymousCache::Read():
+     swap_file* swapFile = find_swap_file(startSlotIndex);
+     // ... pos calculation ...
++    if (swapFile->zram != NULL) {
++        status_t status = zram_swap_read(swapFile->zram, pos,
++            vecs + i, j - i, flags, _numBytes);
++        if (status != B_OK)
++            return status;
++    } else {
++        status_t status = vfs_read_pages(swapFile->vnode, swapFile->cookie,
++            pos, vecs + i, j - i, flags, _numBytes);
++        if (status != B_OK)
++            return status;
++    }
+ 
+@@ VMAnonymousCache::Write():
+     // same as Read but with zram_swap_write instead of vfs_write_pages
+ 
+@@ VMAnonymousCache::WriteAsync():
+     // after obtaining swapFile and pos:
++    if (swapFile->zram != NULL) {
++        generic_size_t written = 0;
++        status_t status = zram_swap_write(swapFile->zram, pos, vecs, 1,
++            numBytes, flags, &written);
++        callback->IOFinished(status, false, written);
++        return status;
++    }
+ 
+@@ New function swap_zram_add():
++status_t
++swap_zram_add(uint64_t diskBytes, uint64_t poolLimit)
++{
++    ZramKernelDevice* dev = NULL;
++    status_t status = zram_kernel_create(diskBytes, poolLimit, &dev);
++    if (status != B_OK)
++        return status;
++
++    uint32_t pageCount = (uint32_t)(diskBytes / B_PAGE_SIZE);
++
++    swap_file* swap = new(std::nothrow) swap_file;
++    if (swap == NULL) {
++        zram_kernel_destroy(dev);
++        return B_NO_MEMORY;
++    }
++    swap->fd = -1;
++    swap->vnode = NULL;
++    swap->cookie = NULL;
++    swap->zram = dev;
++    swap->bmp = radix_bitmap_create(pageCount);
++    if (swap->bmp == NULL) {
++        delete swap;
++        zram_kernel_destroy(dev);
++        return B_NO_MEMORY;
++    }
++
++    mutex_lock(&sSwapFileListLock);
++    if (sSwapFileList.IsEmpty()) {
++        swap->first_slot = 0;
++        swap->last_slot = pageCount;
++    } else {
++        // deja un hueco de una pagina entre swap files
++        swap->first_slot = sSwapFileList.Last()->last_slot + 1;
++        swap->last_slot = swap->first_slot + pageCount;
++    }
++    sSwapFileList.Add(swap);
++    sSwapFileCount++;
++    mutex_unlock(&sSwapFileListLock);
++
++    mutex_lock(&sAvailableSwapSpaceLock);
++    sAvailableSwapSpace += (off_t)pageCount * B_PAGE_SIZE;
++    mutex_unlock(&sAvailableSwapSpaceLock);
++
++    return B_OK;
++}
+ 
+@@ swap_init_post_modules(): al inicio de la funcion:
++    {
++        void* settings = load_driver_settings("virtual_memory");
++        if (settings != NULL) {
++            const char* size = get_driver_parameter(settings, "zram_size",
++                NULL, NULL);
++            const char* pool = get_driver_parameter(settings,
++                "zram_pool_limit", NULL, NULL);
++            if (size != NULL && pool != NULL) {
++                uint64_t zramSize = atoll(size);
++                uint64_t zramPool = atoll(pool);
++                if (zramSize >= (16ull * 1024 * 1024)
++                        && zramPool >= ZRAM_CHUNK_BYTES
++                        && zramPool % ZRAM_CHUNK_BYTES == 0) {
++                    status_t status = swap_zram_add(zramSize, zramPool);
++                    if (status != B_OK)
++                        dprintf("swap_init_post_modules: swap_zram_add: %s\n",
++                            strerror(status));
++                }
++            }
++            unload_driver_settings(settings);
++        }
++    }
++    zram_kernel_debug_init();
+ 
+@@ dump_swap_info(): en el bucle de impresion:
++    if (file->zram != NULL)
++        kprintf("  zram: pages: total: %" B_PRIu32 ", free: %" B_PRIu32 "\n",
++            total, file->bmp->free_slots);
++    else
++        kprintf("  vnode: %p, pages: total: %" B_PRIu32 ", free: %"
++            B_PRIu32 "\n", file->vnode, total, file->bmp->free_slots);
+ 
+@@ swap_file_delete(): al inicio de la funcion:
++    if (swapFile->zram != NULL)
++        return B_NOT_SUPPORTED;

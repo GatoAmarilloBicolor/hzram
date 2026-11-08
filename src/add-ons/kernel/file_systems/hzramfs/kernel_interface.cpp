@@ -111,6 +111,10 @@ parse_number(const char* string, uint64 defaultValue)
 		case '%':
 		{
 			uint64 memory = (uint64)vm_page_num_pages() * B_PAGE_SIZE;
+			/* H-010: Prevent overflow when value > 100 */
+			if (value > 100) {
+				return defaultValue;
+			}
 			value = memory / 100 * value;
 			break;
 		}
@@ -162,10 +166,10 @@ hzram_mem_free(void* pointer)
 
 
 static void*
-hzram_chunk_alloc(size_t bytes)
+hzram_chunk_alloc(void* user, size_t bytes)
 {
 	mutex_lock(&sVolumeLock);
-	struct hzram_volume* volume = sVolume;
+	struct hzram_volume* volume = (struct hzram_volume*)user;
 	if (volume == NULL) {
 		mutex_unlock(&sVolumeLock);
 		return NULL;
@@ -184,10 +188,13 @@ hzram_chunk_alloc(size_t bytes)
 
 
 static void
-hzram_chunk_free(void* pointer, size_t bytes)
+hzram_chunk_free(void* user, void* pointer, size_t bytes)
 {
-	(void)pointer;
+	(void)user;
 	(void)bytes;
+	/* C-001: Real chunk free - use free() since we allocated with malloc in hzram_chunk_alloc */
+	/* Note: In kernel context, this would return to the pool area */
+	free(pointer);
 }
 
 
@@ -283,7 +290,7 @@ hzram_request_refill(void* user)
 }
 
 
-static const ZramPlatformOps sPlatformOps = {
+static ZramPlatformOps sPlatformOps = {
 	hzram_mem_alloc,
 	hzram_mem_free,
 	hzram_chunk_alloc,
@@ -463,6 +470,9 @@ hzram_volume_create(fs_volume* fsVolume, const char* args, status_t* _error)
 	ZramConfig config;
 	config.disk_bytes = volume->diskBytes;
 	config.pool_limit = volume->poolLimit;
+	config.engine = ZRAM_ENGINE_AUTO;
+
+	sPlatformOps.user = volume;
 
 	if (zram_create(&config, &sPlatformOps, &volume->device) != ZRAM_OK) {
 		error = B_NO_MEMORY;
@@ -851,55 +861,18 @@ void
 hzram_volume_get_stats_string(struct hzram_volume* volume, char* buffer,
 	size_t size)
 {
+	if (volume == NULL || buffer == NULL || size == 0)
+		return;
+
+	ZramConfig cfg = {
+		.disk_bytes = volume->diskBytes,
+		.pool_limit = volume->poolLimit,
+	};
+
 	ZramStats stats;
-	memset(&stats, 0, sizeof(stats));
 	zram_get_stats(volume->device, &stats);
 
-	uint64 active = stats.pages_same + stats.pages_lz4 + stats.pages_raw;
-	uint64 ratio = stats.stored_bytes > 0
-		? stats.orig_bytes * 100 / stats.stored_bytes : 0;
-	uint64 savings = stats.orig_bytes > 0
-		? (stats.orig_bytes - stats.stored_bytes) * 100 / stats.orig_bytes : 0;
-
-	snprintf(buffer, size,
-		"volume: %s\n"
-		"swap size: %llu bytes\n"
-		"swap active: %s\n"
-		"disk slots: %llu\n"
-		"pool limit: %llu bytes\n"
-		"pool used: %llu bytes\n"
-		"chunks: %lu / %lu\n"
-		"pages active: %llu (same %llu, lz4 %llu, raw %llu)\n"
-		"pages empty: %llu\n"
-		"orig bytes: %llu\n"
-		"stored bytes: %llu\n"
-		"compression: %llu.%02llu:1 (%llu%% saved)\n"
-		"writes: %llu reads: %llu frees: %llu\n"
-		"errors: write_nomem %llu read_corrupt %llu read_empty %llu\n",
-		volume->name,
-		(unsigned long long)volume->swap.size,
-		volume->swapActive ? "yes" : "no",
-		(unsigned long long)(volume->diskBytes / ZRAM_PAGE_SIZE),
-		(unsigned long long)volume->poolLimit,
-		(unsigned long long)stats.pool_bytes,
-		(unsigned long)stats.chunk_count,
-		(unsigned long)stats.chunk_capacity,
-		(unsigned long long)active,
-		(unsigned long long)stats.pages_same,
-		(unsigned long long)stats.pages_lz4,
-		(unsigned long long)stats.pages_raw,
-		(unsigned long long)stats.pages_empty,
-		(unsigned long long)stats.orig_bytes,
-		(unsigned long long)stats.stored_bytes,
-		(unsigned long long)(ratio / 100),
-		(unsigned long long)(ratio % 100),
-		(unsigned long long)savings,
-		(unsigned long long)stats.writes,
-		(unsigned long long)stats.reads,
-		(unsigned long long)stats.frees,
-		(unsigned long long)stats.write_nomem,
-		(unsigned long long)stats.read_corrupt,
-		(unsigned long long)stats.read_empty);
+	zram_stats_snprintf(buffer, size, &stats, &cfg);
 }
 
 

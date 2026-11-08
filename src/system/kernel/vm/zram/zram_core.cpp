@@ -8,7 +8,18 @@
 
 #include "zram_core.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
+
+#if defined(__aarch64__) || defined(__arm__)
+#  if !defined(ZRAM_TESTING) && !defined(__APPLE__)
+#    include <arm_neon.h>
+#  endif
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+#  include <emmintrin.h>
+#endif
 
 #include "lz4/lz4.h"
 
@@ -18,11 +29,21 @@
  * ============================================================================
  */
 
+/* Per-CPU cache for lock-free allocation (H-005) */
+#define ZRAM_CPU_CACHE_SIZE		16u
+
+struct ZramCpuCache {
+	void*		entries[ZRAM_CPU_CACHE_SIZE];
+	uint32_t	count;
+};
+
 struct ZramClass {
 	uint32_t	size;			/* tamaño de objeto */
-	uint32_t	free_count;		/* objetos en la lista libre */
+	uint32_t	free_count;		/* objetos en la lista libre global */
 	uint32_t	live_count;		/* objetos entregados a slots */
 	void*		free_list;		/* lista intrusiva: primeros 8 bytes = next */
+	struct ZramCpuCache*	cpu_caches;	/* array de per-CPU caches [ctx_count] */
+	uint32_t	cpu_cache_count;	/* número de CPUs (ctx_count) */
 };
 
 struct ZramReserver {
@@ -35,6 +56,7 @@ struct alignas(64) ZramCtx {
 	LZ4_stream_t		state;
 	alignas(64) uint8_t	out_buf[ZRAM_PAGE_SIZE];
 	alignas(64) uint8_t	page[ZRAM_PAGE_SIZE];
+	uint32_t		cpu_index;	/* índice de CPU/context para per-CPU cache */
 };
 
 struct ZramDevice {
@@ -50,20 +72,20 @@ struct ZramDevice {
 	uint64_t				disk_bytes;
 	uint64_t				pool_limit;
 
-	volatile uint32_t		reserver_count;
-	volatile uint64_t		pool_bytes;
-
-	uint64_t				pages_same;
-	uint64_t				pages_raw;
-	uint64_t				pages_lz4;
-	uint64_t				orig_bytes;
-	uint64_t				stored_bytes;
-	uint64_t				writes;
-	uint64_t				reads;
-	uint64_t				frees;
-	uint64_t				write_nomem;
-	uint64_t				read_corrupt;
-	uint64_t				read_empty;
+	/* Hot counters - aligned to cache lines to avoid false sharing (H-001) */
+	alignas(64) volatile uint32_t		reserver_count;
+	alignas(64) volatile uint64_t		pool_bytes;
+	alignas(64) volatile uint64_t		pages_same;
+	alignas(64) volatile uint64_t		pages_raw;
+	alignas(64) volatile uint64_t		pages_lz4;
+	alignas(64) volatile uint64_t		orig_bytes;
+	alignas(64) volatile uint64_t		stored_bytes;
+	alignas(64) volatile uint64_t		writes;
+	alignas(64) volatile uint64_t		reads;
+	alignas(64) volatile uint64_t		frees;
+	alignas(64) volatile uint64_t		write_nomem;
+	alignas(64) volatile uint64_t		read_corrupt;
+	alignas(64) volatile uint64_t		read_empty;
 
 	void**					chunks;
 	uint32_t				chunk_count;
@@ -79,6 +101,9 @@ struct ZramDevice {
 	void*					ctx_sem;
 
 	bool					destroyed;
+
+	/* Engine selection (H-007) */
+	ZramEngine				engine;
 };
 
 /*
@@ -95,6 +120,34 @@ zram_classes_init(ZramDevice* dev)
 		dev->classes[c].free_count = 0;
 		dev->classes[c].live_count = 0;
 		dev->classes[c].free_list = NULL;
+		dev->classes[c].cpu_caches = NULL;
+		dev->classes[c].cpu_cache_count = 0;
+	}
+}
+
+static int
+zram_cpu_caches_init(ZramDevice* dev)
+{
+	for (uint32_t c = 0; c < ZRAM_CLASS_COUNT; c++) {
+		dev->classes[c].cpu_cache_count = dev->ctx_count;
+		dev->classes[c].cpu_caches = (struct ZramCpuCache*)dev->ops->mem_alloc(
+			dev->ctx_count * sizeof(struct ZramCpuCache));
+		if (dev->classes[c].cpu_caches == NULL)
+			return ZRAM_E_NOMEM;
+		memset(dev->classes[c].cpu_caches, 0, dev->ctx_count * sizeof(struct ZramCpuCache));
+	}
+	return ZRAM_OK;
+}
+
+static void
+zram_cpu_caches_fini(ZramDevice* dev)
+{
+	for (uint32_t c = 0; c < ZRAM_CLASS_COUNT; c++) {
+		if (dev->classes[c].cpu_caches != NULL) {
+			dev->ops->mem_free(dev->classes[c].cpu_caches);
+			dev->classes[c].cpu_caches = NULL;
+			dev->classes[c].cpu_cache_count = 0;
+		}
 	}
 }
 
@@ -131,7 +184,7 @@ static void
 zram_reserver_push(ZramDevice* dev, void* span)
 {
 	if (dev->reserver.count >= dev->reserver.capacity) {
-		dev->ops->chunk_free(span, ZRAM_SPAN_BYTES);
+		dev->ops->chunk_free(dev->ops->user, span, ZRAM_SPAN_BYTES);
 		dev->pool_bytes -= ZRAM_SPAN_BYTES;
 		return;
 	}
@@ -143,8 +196,18 @@ zram_reserver_push(ZramDevice* dev, void* span)
 /* Reserva un objeto de la clase c. Devuelve NULL si no hay memoria.
  * El llamador debe tener class_mutexes[c] tomado. */
 static void*
-zram_class_alloc(ZramDevice* dev, uint32_t c)
+zram_class_alloc(ZramDevice* dev, uint32_t c, uint32_t cpu)
 {
+	struct ZramCpuCache* cache = &dev->classes[c].cpu_caches[cpu];
+	
+	/* Try per-CPU cache first (lock-free for own CPU) */
+	if (cache->count > 0) {
+		void* obj = cache->entries[--cache->count];
+		dev->classes[c].live_count++;
+		return obj;
+	}
+	
+	/* Fallback to global free list (requires class mutex) */
 	if (dev->classes[c].free_list == NULL) {
 		dev->ops->mutex_lock(dev->reserver_lock);
 		void* span = zram_reserver_pop(dev);
@@ -169,8 +232,18 @@ zram_class_alloc(ZramDevice* dev, uint32_t c)
 
 /* Devuelve un objeto a su clase. El llamador debe tener class_mutexes[c]. */
 static void
-zram_class_free(ZramDevice* dev, uint32_t c, void* obj)
+zram_class_free(ZramDevice* dev, uint32_t c, void* obj, uint32_t cpu)
 {
+	struct ZramCpuCache* cache = &dev->classes[c].cpu_caches[cpu];
+	
+	/* Try per-CPU cache first */
+	if (cache->count < ZRAM_CPU_CACHE_SIZE) {
+		cache->entries[cache->count++] = obj;
+		dev->classes[c].live_count--;
+		return;
+	}
+	
+	/* Per-CPU cache full, flush to global free list (requires class mutex) */
 	*(void**)obj = dev->classes[c].free_list;
 	dev->classes[c].free_list = obj;
 	dev->classes[c].free_count++;
@@ -188,16 +261,16 @@ zram_class_free(ZramDevice* dev, uint32_t c, void* obj)
 }
 
 
-/* Lookup O(1) sin ramas (O5): (n + 255) >> 8 mapea a la clase adecuada */
-static const uint8_t kSizeToClass[16] = {
-	0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 9
+/* Lookup O(1) sin ramas: mapea tamaño a clase (0-255→0, 256-383→0, 384-511→1, etc) */
+static const uint8_t kSizeToClass[17] = {
+	0, 0, 0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7, 8, 9, 9, 10
 };
 
 static inline uint32_t
 zram_class_for_size(uint32_t n)
 {
 	uint32_t idx = (n + 255u) >> 8;
-	return idx < 16u ? (uint32_t)kSizeToClass[idx] : ZRAM_CLASS_RAW;
+	return idx < 17u ? (uint32_t)kSizeToClass[idx] : ZRAM_CLASS_RAW;
 }
 
 /*
@@ -216,18 +289,34 @@ zram_refill(ZramDevice* dev)
 
 	while (dev->reserver.count < ZRAM_RESERVE_TARGET
 			&& dev->pool_bytes + ZRAM_CHUNK_BYTES <= dev->pool_limit) {
-		void* chunk = dev->ops->chunk_alloc(ZRAM_CHUNK_BYTES);
+		void* chunk = dev->ops->chunk_alloc(dev->ops->user, ZRAM_CHUNK_BYTES);
 		if (chunk == NULL)
 			break;
 
-		if (dev->chunk_count < dev->chunk_capacity)
-			dev->chunks[dev->chunk_count++] = chunk;
-
+		bool all_pushed = true;
 		for (uint32_t i = 0; i < ZRAM_CHUNK_BYTES / ZRAM_SPAN_BYTES; i++) {
-			zram_reserver_push(dev,
-				(uint8_t*)chunk + i * ZRAM_SPAN_BYTES);
+			void* span = (uint8_t*)chunk + i * ZRAM_SPAN_BYTES;
+			if (dev->reserver.count >= dev->reserver.capacity) {
+				/* Reserver full - free remaining spans in this chunk */
+				dev->ops->chunk_free(dev->ops->user, span, ZRAM_SPAN_BYTES);
+				all_pushed = false;
+			} else {
+				dev->reserver.spans[dev->reserver.count++] = span;
+			}
 		}
-		dev->pool_bytes += ZRAM_CHUNK_BYTES;
+
+		if (all_pushed) {
+			if (dev->chunk_count < dev->chunk_capacity)
+				dev->chunks[dev->chunk_count++] = chunk;
+			dev->pool_bytes += ZRAM_CHUNK_BYTES;
+			dev->reserver_count = dev->reserver.count;
+		} else {
+			/* Some spans freed - free the chunk allocation */
+			dev->ops->chunk_free(dev->ops->user, chunk, ZRAM_CHUNK_BYTES);
+			/* reserver_count already updated in loop */
+			dev->reserver_count = dev->reserver.count;
+			break; /* No point continuing if reserver full */
+		}
 	}
 
 	dev->ops->mutex_unlock(dev->reserver_lock);
@@ -248,21 +337,43 @@ zram_can_accept(ZramDevice* dev)
 
 /*
  * ============================================================================
- * DETECCIÓN DE PÁGINA REPETIDA
+ * DETECCIÓN DE PÁGINA REPETIDA (SIMD-optimizado)
  * ============================================================================
  */
 
-static bool
+static inline bool
 zram_is_same_page(const void* page, uint64_t* _pattern)
 {
 	const uint64_t* words = (const uint64_t*)page;
 	uint64_t first = words[0];
 
-	/* Check all words in one pass */
+#if defined(__HAIKU__)
+	/* NEON: 128-bit loads, compare 2 uint64_t per iteration */
+#  include <arm_neon.h>
+	uint64x2_t vfirst = vdupq_n_u64(first);
+	for (uint32_t i = 1; i < (ZRAM_PAGE_SIZE / sizeof(uint64_t)); i += 2) {
+		uint64x2_t v = vld1q_u64(&words[i]);
+		uint64x2_t eq = vceqq_u64(v, vfirst);
+		if (vgetq_lane_u64(eq, 0) != ~0ULL || vgetq_lane_u64(eq, 1) != ~0ULL)
+			return false;
+	}
+#elif defined(__x86_64__) || defined(__i386__)
+	/* SSE2: 128-bit loads, compare 2 uint64_t per iteration */
+	#include <emmintrin.h>
+	__m128i vfirst = _mm_set1_epi64x((long long)first);
+	for (uint32_t i = 1; i < (ZRAM_PAGE_SIZE / sizeof(uint64_t)); i += 2) {
+		__m128i v = _mm_loadu_si128((const __m128i*)&words[i]);
+		__m128i eq = _mm_cmpeq_epi64(v, vfirst);
+		if (_mm_movemask_epi8(eq) != 0xFFFF)
+			return false;
+	}
+#else
+	/* Fallback scalar */
 	for (uint32_t i = 1; i < (ZRAM_PAGE_SIZE / sizeof(uint64_t)); i++) {
 		if (words[i] != first)
 			return false;
 	}
+#endif
 
 	*_pattern = first;
 	return true;
@@ -284,14 +395,23 @@ zram_ctx_get(ZramDevice* dev)
 
 	dev->ops->mutex_lock(dev->ctx_mutex);
 	ZramCtx* ctx = NULL;
+	uint32_t ctx_idx = dev->ctx_count;
 	for (uint32_t i = 0; i < dev->ctx_count; i++) {
 		if (!dev->ctx_in_use[i]) {
 			dev->ctx_in_use[i] = true;
 			ctx = dev->ctxs[i];
+			ctx_idx = i;
 			break;
 		}
 	}
 	dev->ops->mutex_unlock(dev->ctx_mutex);
+
+	/* C-005: If no ctx available, release semaphore to avoid leak */
+	if (ctx == NULL) {
+		dev->ops->sem_release(dev->ctx_sem);
+	} else {
+		ctx->cpu_index = ctx_idx;
+	}
 
 	return ctx;
 }
@@ -344,13 +464,25 @@ zram_write_page(ZramDevice* dev, ZramCtx* ctx, uint32_t slot, const void* page)
 		nuevo.pattern = pattern;
 		nuevo.size = 0;
 	} else {
+		/* H-007: Engine selection with AUTO heuristic */
+		ZramEngine engine = dev->engine;
+		if (engine == ZRAM_ENGINE_AUTO) {
+			/* AUTO heuristic: could use different acceleration levels based on entropy */
+			/* For now, always use LZ4 fast (acceleration=1) */
+			engine = ZRAM_ENGINE_CPU_LZ4;
+		}
+
+		/* H-004: Reset LZ4 stream state for deterministic compression */
+		LZ4_resetStream(&ctx->state);
+
+		/* LZ4 Fast mode (default) */
 		int n = LZ4_compress_fast_extState(&ctx->state, (const char*)page,
 			(char*)ctx->out_buf, ZRAM_PAGE_SIZE, ZRAM_MAX_COMPRESSED, 1);
 
 		if (n > 0) {
 			uint32_t cls = zram_class_for_size((uint32_t)n);
 			dev->ops->mutex_lock(dev->class_mutexes[cls]);
-			void* obj = zram_class_alloc(dev, cls);
+			void* obj = zram_class_alloc(dev, cls, ctx->cpu_index);
 			dev->ops->mutex_unlock(dev->class_mutexes[cls]);
 
 			if (obj == NULL) {
@@ -365,7 +497,7 @@ zram_write_page(ZramDevice* dev, ZramCtx* ctx, uint32_t slot, const void* page)
 			nuevo.cls = (uint8_t)cls;
 		} else {
 			dev->ops->mutex_lock(dev->class_mutexes[ZRAM_CLASS_RAW]);
-			void* obj = zram_class_alloc(dev, ZRAM_CLASS_RAW);
+			void* obj = zram_class_alloc(dev, ZRAM_CLASS_RAW, ctx->cpu_index);
 			dev->ops->mutex_unlock(dev->class_mutexes[ZRAM_CLASS_RAW]);
 
 			if (obj == NULL) {
@@ -415,7 +547,7 @@ zram_write_page(ZramDevice* dev, ZramCtx* ctx, uint32_t slot, const void* page)
 
 	if (viejo.state == ZRAM_RAW || viejo.state == ZRAM_LZ4) {
 		dev->ops->mutex_lock(dev->class_mutexes[viejo.cls]);
-		zram_class_free(dev, viejo.cls, viejo.data);
+		zram_class_free(dev, viejo.cls, viejo.data, ctx->cpu_index);
 		dev->ops->mutex_unlock(dev->class_mutexes[viejo.cls]);
 	}
 
@@ -523,8 +655,10 @@ zram_free_slots(ZramDevice* dev, uint32_t first, uint32_t count)
 				uint8_t old_cls = viejo.cls;
 				dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
 				
+				/* Use slot index to distribute frees across CPU caches */
+				uint32_t free_cpu = i % dev->ctx_count;
 				dev->ops->mutex_lock(dev->class_mutexes[old_cls]);
-				zram_class_free(dev, old_cls, old_data);
+				zram_class_free(dev, old_cls, old_data, free_cpu);
 				dev->ops->mutex_unlock(dev->class_mutexes[old_cls]);
 			} else {
 				dev->ops->mutex_unlock(dev->stripe_locks[stripe]);
@@ -558,8 +692,9 @@ zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops, ZramDevice** _out
 	uint32_t ctx_count = ops->cpu_count();
 	if (ctx_count == 0)
 		ctx_count = 1;
-	if (ctx_count > 8)
-		ctx_count = 8;
+	/* H-003: Remove hardcoded limit - allow up to 256 contexts for large systems */
+	if (ctx_count > 256)
+		ctx_count = 256;
 
 	ZramDevice* dev = (ZramDevice*)ops->mem_alloc(sizeof(ZramDevice));
 	if (dev == NULL)
@@ -571,6 +706,9 @@ zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops, ZramDevice** _out
 	dev->pool_limit = cfg->pool_limit;
 	dev->slot_count = slot_count;
 	dev->ctx_count = ctx_count;
+	/* H-007: Engine selection */
+	dev->engine = cfg->engine != ZRAM_ENGINE_AUTO && cfg->engine <= ZRAM_ENGINE_CPU_LZ4 
+		? cfg->engine : ZRAM_ENGINE_AUTO;
 
 	dev->slots = (ZramSlot*)ops->mem_alloc(slot_count * sizeof(ZramSlot));
 	if (dev->slots == NULL)
@@ -615,10 +753,12 @@ zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops, ZramDevice** _out
 		dev->slots[i].size = 0;
 		dev->slots[i].state = ZRAM_EMPTY;
 		dev->slots[i].cls = 0;
-		dev->slots[i].reserved = 0;
 	}
 
 	zram_classes_init(dev);
+
+	if (zram_cpu_caches_init(dev) != ZRAM_OK)
+		goto fail;
 
 	for (uint32_t i = 0; i < ctx_count; i++) {
 		dev->ctxs[i] = (ZramCtx*)ops->mem_alloc(sizeof(ZramCtx));
@@ -636,6 +776,7 @@ zram_create(const ZramConfig* cfg, const ZramPlatformOps* ops, ZramDevice** _out
 	}
 
 	dev->destroyed = false;
+
 	*_out = dev;
 	return ZRAM_OK;
 
@@ -652,6 +793,8 @@ zram_destroy(ZramDevice* dev)
 		return;
 	dev->destroyed = true;
 
+	/* C-008: Free in reverse order - locks last */
+	/* 1. Free contexts first (they may hold locks) */
 	if (dev->ctxs != NULL) {
 		for (uint32_t i = 0; i < dev->ctx_count; i++) {
 			if (dev->ctxs[i] != NULL)
@@ -661,22 +804,33 @@ zram_destroy(ZramDevice* dev)
 	}
 	if (dev->ctx_in_use != NULL)
 		dev->ops->mem_free(dev->ctx_in_use);
+
+	/* 2. Free slots array */
 	if (dev->slots != NULL)
 		dev->ops->mem_free(dev->slots);
+
+	/* 3. Free reserver spans array */
 	if (dev->reserver.spans != NULL)
 		dev->ops->mem_free(dev->reserver.spans);
 
+	/* 4. Free chunks - these were allocated via chunk_alloc */
 	for (uint32_t i = 0; i < dev->chunk_count; i++)
-		dev->ops->chunk_free(dev->chunks[i], ZRAM_CHUNK_BYTES);
+		dev->ops->chunk_free(dev->ops->user, dev->chunks[i], ZRAM_CHUNK_BYTES);
 	if (dev->chunks != NULL)
 		dev->ops->mem_free(dev->chunks);
 
+	/* 4.5. Flush and free per-CPU caches */
+	zram_cpu_caches_fini(dev);
+
+	/* 5. Delete synchronization primitives (class_mutexes before stripe_locks) */
 	if (dev->ctx_sem != NULL)
 		dev->ops->sem_delete(dev->ctx_sem);
 	if (dev->ctx_mutex != NULL)
 		dev->ops->mutex_delete(dev->ctx_mutex);
 	if (dev->reserver_lock != NULL)
 		dev->ops->mutex_delete(dev->reserver_lock);
+	
+	/* C-008: class_mutexes BEFORE stripe_locks to avoid deadlock with free_slots */
 	for (uint32_t i = 0; i < ZRAM_CLASS_COUNT; i++) {
 		if (dev->class_mutexes[i] != NULL)
 			dev->ops->mutex_delete(dev->class_mutexes[i]);
@@ -797,4 +951,148 @@ zram_check_invariants(ZramDevice* dev)
 		return false;
 
 	return true;
+}
+
+
+/*
+ * ============================================================================
+ * ESTADÍSTICAS FORMATO POSIX (snprintf/fprintf)
+ * ============================================================================
+ */
+
+/* Calcula ratio de compresión en porcentaje (100 = 1:1, 200 = 2:1, etc.) */
+static inline uint32_t
+zram_calc_ratio(uint64_t orig, uint64_t stored)
+{
+	if (stored == 0)
+		return orig > 0 ? 10000 : 100;	/* SAME pages: treat as 100:1 */
+	return (uint32_t)((orig * 100) / stored);
+}
+
+/* Formatea bytes en notación humana (KiB, MiB, GiB) */
+static void
+zram_fmt_bytes(char* buf, size_t size, uint64_t bytes)
+{
+	const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+	int unit = 0;
+	double val = (double)bytes;
+	while (val >= 1024.0 && unit < 4) {
+		val /= 1024.0;
+		unit++;
+	}
+	snprintf(buf, size, "%.2f %s", val, units[unit]);
+}
+
+const char*
+zram_engine_name(ZramEngine engine)
+{
+	switch (engine) {
+	case ZRAM_ENGINE_CPU_LZ4:       return "cpu-lz4";
+	case ZRAM_ENGINE_AUTO:          return "auto";
+	default:                        return "unknown";
+	}
+}
+
+int
+zram_stats_snprintf(char* buf, size_t size, const ZramStats* st,
+		    const ZramConfig* cfg)
+{
+	if (buf == NULL || size == 0 || st == NULL)
+		return -1;
+
+	char orig_buf[32], stored_buf[32], pool_buf[32];
+	zram_fmt_bytes(orig_buf, sizeof(orig_buf), st->orig_bytes);
+	zram_fmt_bytes(stored_buf, sizeof(stored_buf), st->stored_bytes);
+	zram_fmt_bytes(pool_buf, sizeof(pool_buf), st->pool_bytes);
+
+	uint64_t total_pages = st->pages_same + st->pages_raw + st->pages_lz4 + st->pages_empty;
+	uint64_t active_pages = st->pages_same + st->pages_raw + st->pages_lz4;
+	uint32_t ratio = zram_calc_ratio(st->orig_bytes, st->stored_bytes);
+
+	/* Format config values first */
+	char disk_size_buf[32] = "unknown";
+	char pool_limit_buf[32] = "unknown";
+	if (cfg) {
+		zram_fmt_bytes(disk_size_buf, sizeof(disk_size_buf), cfg->disk_bytes);
+		zram_fmt_bytes(pool_limit_buf, sizeof(pool_limit_buf), cfg->pool_limit);
+	}
+
+	/* Format dynamic values */
+	char same_saved_buf[32];
+	zram_fmt_bytes(same_saved_buf, sizeof(same_saved_buf), st->pages_same * ZRAM_PAGE_SIZE);
+
+	char lz4_stored_buf[32] = "0 B";
+	uint32_t lz4_ratio = 100;
+	if (st->pages_lz4 > 0) {
+		uint64_t lz4_stored = st->stored_bytes - st->pages_raw * ZRAM_PAGE_SIZE;
+		zram_fmt_bytes(lz4_stored_buf, sizeof(lz4_stored_buf), lz4_stored);
+		lz4_ratio = zram_calc_ratio(st->pages_lz4 * ZRAM_PAGE_SIZE, lz4_stored);
+	}
+
+	char raw_stored_buf[32];
+	zram_fmt_bytes(raw_stored_buf, sizeof(raw_stored_buf), st->pages_raw * ZRAM_PAGE_SIZE);
+
+	double same_pct = active_pages > 0 ? (double)st->pages_same * 100.0 / active_pages : 0.0;
+	double lz4_pct = active_pages > 0 ? (double)st->pages_lz4 * 100.0 / active_pages : 0.0;
+	double raw_pct = active_pages > 0 ? (double)st->pages_raw * 100.0 / active_pages : 0.0;
+	double active_pct = total_pages > 0 ? (double)active_pages * 100.0 / total_pages : 0.0;
+
+	int len = snprintf(buf, size,
+		"zram_stats:\n"
+		"  config:\n"
+		"    disk_size:        %s\n"
+		"    pool_limit:       %s\n"
+		"  pages:\n"
+		"    total_slots:      %" PRIu64 "\n"
+		"    active_pages:     %" PRIu64 " (%.2f%%)\n"
+		"    empty_pages:      %" PRIu64 "\n"
+		"  compression_layers:\n"
+		"    SAME (identical): %" PRIu64 " pages (%5.2f%%)  ratio: %u%%  saved: %s\n"
+		"    LZ4  (compressed): %" PRIu64 " pages (%5.2f%%)  ratio: %u%%  stored: %s\n"
+		"    RAW  (incompress): %" PRIu64 " pages (%5.2f%%)  ratio: 100%%  stored: %s\n"
+		"  aggregate:\n"
+		"    orig_bytes:       %s\n"
+		"    stored_bytes:     %s\n"
+		"    compression_ratio: %u.%02u%%\n"
+		"    pool_allocated:   %s\n"
+		"  class_distribution:\n",
+		disk_size_buf, pool_limit_buf,
+		total_pages,
+		active_pages, active_pct,
+		st->pages_empty,
+		st->pages_same, same_pct, ratio, same_saved_buf,
+		st->pages_lz4, lz4_pct, lz4_ratio, lz4_stored_buf,
+		st->pages_raw, raw_pct, raw_stored_buf,
+		orig_buf, stored_buf, ratio / 100, ratio % 100, pool_buf);
+
+	/* Append class distribution */
+	for (uint32_t c = 0; c < ZRAM_CLASS_COUNT && len < (int)size; c++) {
+		if (st->class_live[c] > 0 || st->class_free[c] > 0) {
+			len += snprintf(buf + len, size - len,
+				"    class %2u (%4u B): live=%5u free=%5u\n",
+				c, kZramClassSize[c], st->class_live[c], st->class_free[c]);
+		}
+	}
+
+	/* Reserver info */
+	if (len < (int)size) {
+		snprintf(buf + len, size - len,
+			"  reserver: spans=%u/%u\n",
+			st->reserver_count, st->reserver_capacity);
+	}
+
+	return len;
+}
+
+int
+zram_stats_fprintf(FILE* fp, const ZramStats* st, const ZramConfig* cfg)
+{
+	if (fp == NULL || st == NULL)
+		return -1;
+
+	char buf[2048];
+	int len = zram_stats_snprintf(buf, sizeof(buf), st, cfg);
+	if (len < 0)
+		return -1;
+	return fprintf(fp, "%s", buf);
 }

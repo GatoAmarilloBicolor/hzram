@@ -62,6 +62,10 @@ bool		zram_kernel_can_accept(ZramKernelDevice* dev);
 void		zram_kernel_get_stats(ZramKernelDevice* dev, ZramStats* out);
 bool		zram_kernel_check_invariants(ZramKernelDevice* dev);
 
+/* POSIX-style formatted stats output (kernel-safe: uses kprintf internally) */
+int		zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size);
+int		zram_kernel_stats_kprintf(ZramKernelDevice* dev);
+
 /* Registra el comando de depuración "zram" en KDL (se llama desde swap_init). */
 void		zram_kernel_debug_init(void);
 

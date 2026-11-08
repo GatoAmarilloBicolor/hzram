@@ -80,7 +80,7 @@ test_create_destroy(void)
 {
 	printf("Test 1: Create and destroy...\n");
 
-	ZramConfig cfg = { 4u * 1024 * 1024, ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 4u * 1024 * 1024, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	int rc = zram_create(&cfg, &g_host_ops, &dev);
 	CHECK(rc == ZRAM_OK, "zram_create should succeed");
@@ -109,7 +109,7 @@ test_zero_page(void)
 {
 	printf("Test 2: Zero page...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -146,7 +146,7 @@ test_same_page(void)
 {
 	printf("Test 3: Same-fill page...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -185,7 +185,7 @@ test_lz4_page(void)
 {
 	printf("Test 4: LZ4 compressible page...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -223,7 +223,7 @@ test_raw_page(void)
 {
 	printf("Test 5: Incompressible (RAW) page...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -258,7 +258,7 @@ test_overwrite(void)
 {
 	printf("Test 6: Overwrite and state transitions...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -306,7 +306,7 @@ test_free_slots(void)
 {
 	printf("Test 7: Free slots...\n");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, 2u * ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -363,7 +363,7 @@ test_oom(void)
 {
 	printf("Test 8: Out-of-memory handling...\n");
 
-	ZramConfig cfg = { 4u * 1024 * 1024, ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 4u * 1024 * 1024, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 
@@ -413,7 +413,7 @@ test_bulk_roundtrip(void)
 {
 	printf("Test 9: Bulk roundtrip (mixed content)...\n");
 
-	ZramConfig cfg = { 2u * 1024 * 1024, 4u * ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 2u * 1024 * 1024, 4u * ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	ZramDevice* dev = nullptr;
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create");
 	host_set_active_device(dev);
@@ -484,18 +484,18 @@ test_validation(void)
 	printf("Test 10: Input validation...\n");
 
 	ZramDevice* dev = nullptr;
-	ZramConfig bad1 = { 0, ZRAM_CHUNK_BYTES };
+	ZramConfig bad1 = { 0, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	CHECK(zram_create(&bad1, &g_host_ops, &dev) == ZRAM_E_INVAL, "zero disk_bytes");
 
-	ZramConfig bad2 = { 4096, 0 };
+	ZramConfig bad2 = { 4096, 0, ZRAM_ENGINE_AUTO };
 	CHECK(zram_create(&bad2, &g_host_ops, &dev) == ZRAM_E_INVAL, "zero pool_limit");
 
-	ZramConfig bad3 = { 4096, 12345 };
+	ZramConfig bad3 = { 4096, 12345, ZRAM_ENGINE_AUTO };
 	CHECK(zram_create(&bad3, &g_host_ops, &dev) == ZRAM_E_INVAL, "unaligned pool_limit");
 
 	CHECK(zram_create(nullptr, &g_host_ops, &dev) == ZRAM_E_INVAL, "null config");
 
-	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES };
+	ZramConfig cfg = { 1u * 1024 * 1024, ZRAM_CHUNK_BYTES, ZRAM_ENGINE_AUTO };
 	CHECK(zram_create(&cfg, &g_host_ops, &dev) == ZRAM_OK, "create ok");
 
 	ZramCtx* ctx = zram_ctx_get(dev);

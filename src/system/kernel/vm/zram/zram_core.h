@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,13 +22,13 @@ extern "C" {
 #define ZRAM_SPAN_BYTES			(64u * 1024u)
 #define ZRAM_CHUNK_BYTES		(1024u * 1024u)	/* 16 spans por chunk */
 #define ZRAM_STRIPES			64u
-#define ZRAM_MAX_COMPRESSED		3072u
-#define ZRAM_CLASS_COUNT		10u
+#define ZRAM_MAX_COMPRESSED		4096u  /* H-006: Allow full page storage */
+#define ZRAM_CLASS_COUNT		11u
 
 static const uint32_t kZramClassSize[ZRAM_CLASS_COUNT] = {
-	256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096
+	256, 384, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096
 };
-#define ZRAM_CLASS_RAW			9u
+#define ZRAM_CLASS_RAW			10u  /* 4096 = last class */
 
 /* Tamaño de la reserva inicial de spans */
 #define ZRAM_RESERVE_TARGET		4u
@@ -47,14 +48,13 @@ enum ZramError {
 };
 
 /*
- * ZramSlot - exactamente 16 bytes (verificado con static_assert)
+ * ZramSlot - exactamente 14 bytes (packed, sin padding)
  *
  *   [0:8]   data (void*)       -> RAW o LZ4: puntero al objeto
  *           pattern (uint64_t) -> SAME: palabra repetida
  *   [8:12]  size (uint32_t)    -> bytes comprimidos (LZ4); 4096 (RAW); 0 resto
  *   [12:13] state (uint8_t)    -> ZramState
  *   [13:14] cls (uint8_t)      -> clase de tamaño (RAW o LZ4)
- *   [14:16] reserved (uint16_t)
  */
 struct ZramSlot {
 	union {
@@ -64,17 +64,23 @@ struct ZramSlot {
 	uint32_t		size;
 	uint8_t			state;
 	uint8_t			cls;
-	uint16_t		reserved;
-};
+} __attribute__((packed));
 
 #ifdef __cplusplus
-static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes");
+static_assert(sizeof(ZramSlot) == 14, "ZramSlot must be exactly 14 bytes (packed)");
 static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
 #endif
+
+/* Motor de compresión CPU. Extensible para GPU futuro. */
+typedef enum {
+	ZRAM_ENGINE_CPU_LZ4      = 0,  /* LZ4 fast (default, latency ~2 us/page) */
+	ZRAM_ENGINE_AUTO         = 255 /* auto-selección por heurística */
+} ZramEngine;
 
 struct ZramConfig {
 	uint64_t	disk_bytes;	/* tamaño nominal; slots = disk_bytes / 4096 */
 	uint64_t	pool_limit;	/* tope de memoria física (múltiplo de CHUNK) */
+	ZramEngine	engine;		/* motor de compresión (default: AUTO) */
 };
 
 struct ZramStats {
@@ -112,12 +118,13 @@ void*		zram_ctx_page(ZramCtx* ctx);
 
 /*
  * Operaciones de plataforma - abstraen las primitivas de memoria y locking.
+ * chunk_alloc/free reciben 'user' para contexto del device (POSIX-like).
  */
 struct ZramPlatformOps {
 	void*		(*mem_alloc)(size_t size);
 	void		(*mem_free)(void* ptr);
-	void*		(*chunk_alloc)(size_t bytes);
-	void		(*chunk_free)(void* ptr, size_t bytes);
+	void*		(*chunk_alloc)(void* user, size_t bytes);
+	void		(*chunk_free)(void* user, void* ptr, size_t bytes);
 	void*		(*mutex_new)(void);
 	void		(*mutex_lock)(void* lock);
 	void		(*mutex_unlock)(void* lock);
@@ -128,6 +135,7 @@ struct ZramPlatformOps {
 	void		(*sem_delete)(void* sem);
 	uint32_t	(*cpu_count)(void);
 	void		(*request_refill)(void* user);
+
 	void*		user;
 };
 
@@ -149,7 +157,14 @@ void		zram_free_slots(ZramDevice* dev, uint32_t first, uint32_t count);
 bool		zram_can_accept(ZramDevice* dev);
 int			zram_refill(ZramDevice* dev);
 void		zram_get_stats(ZramDevice* dev, ZramStats* out);
+
+/* POSIX-style formatted stats output */
+int			zram_stats_snprintf(char* buf, size_t size, const ZramStats* st,
+					const ZramConfig* cfg);
+int			zram_stats_fprintf(FILE* fp, const ZramStats* st, const ZramConfig* cfg);
+
 bool		zram_check_invariants(ZramDevice* dev);
+const char*		zram_engine_name(ZramEngine engine);
 
 #ifdef ZRAM_TESTING
 uint8_t		zram_test_slot_state(const ZramDevice* dev, uint32_t slot);
