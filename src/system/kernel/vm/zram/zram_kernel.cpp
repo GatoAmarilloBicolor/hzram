@@ -46,6 +46,7 @@ struct ZramKernelDevice {
 
 static ZramKernelDevice* g_kernel_devices = NULL;
 static void* g_devices_lock = NULL;
+static _Atomic int g_devices_lock_init = 0;
 
 /*
  * ============================================================================
@@ -93,6 +94,8 @@ kern_chunk_free(void* user, void* ptr, size_t bytes)
 	(void)user;
 	(void)ptr;
 	(void)bytes;
+	/* Bump allocator from wired area (create_area) - no per-chunk free.
+	 * The entire pool area is freed on device destruction. */
 }
 
 
@@ -315,11 +318,19 @@ zram_kernel_create(uint64_t diskBytes, uint64_t poolLimit,
 	}
 	resume_thread(dev->refill_thread);
 
-	/* Add to global list for KDL debugging */
-	if (g_devices_lock == NULL) {
-		g_devices_lock = malloc(sizeof(mutex));
-		if (g_devices_lock) {
-			mutex_init((mutex*)g_devices_lock, "zram devices");
+	/* Add to global list for KDL debugging - thread-safe lazy init */
+	if (atomic_load_explicit(&g_devices_lock_init, memory_order_acquire) == 0) {
+		void* lock = malloc(sizeof(mutex));
+		if (lock) {
+			mutex_init((mutex*)lock, "zram devices");
+			if (atomic_compare_exchange_strong_explicit(&g_devices_lock_init, &(int){0}, 1,
+				memory_order_acq_rel, memory_order_acquire)) {
+				g_devices_lock = lock;
+			} else {
+				/* Another thread won - destroy our lock */
+				mutex_destroy((mutex*)lock);
+				free(lock);
+			}
 		}
 	}
 	if (g_devices_lock) {
@@ -398,9 +409,14 @@ zram_kernel_destroy(ZramKernelDevice* dev)
 	if (dev == NULL)
 		return;
 
-	/* C-002: Wait for all references to drop before destroying */
+	/* C-002: Wait for all references to drop before destroying.
+	 * Use semaphore instead of busy-wait to avoid CPU spinning. */
 	while (atomic_load_explicit(&dev->ref_count, memory_order_acquire) > 0) {
-		snooze(1000); /* 1ms */
+		if (dev->refill_sem >= 0) {
+			acquire_sem(dev->refill_sem);
+		} else {
+			snooze(1000); /* fallback */
+		}
 	}
 
 	zram_kernel_dev_put(dev);
@@ -642,9 +658,19 @@ zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size)
 	zram_kernel_fmt_bytes(stored_buf, sizeof(stored_buf), st.stored_bytes);
 	zram_kernel_fmt_bytes(pool_buf, sizeof(pool_buf), st.pool_bytes);
 
-	/* Format dynamic values */
+	uint64_t total_pages = st.pages_same + st.pages_raw + st.pages_lz4 + st.pages_empty;
+	uint64_t active_pages = st.pages_same + st.pages_raw + st.pages_lz4;
+	uint32_t ratio = zram_kernel_calc_ratio(st.orig_bytes, st.stored_bytes);
+
+	double same_pct = active_pages > 0 ? (double)st.pages_same * 100.0 / active_pages : 0.0;
+	double lz4_pct = active_pages > 0 ? (double)st.pages_lz4 * 100.0 / active_pages : 0.0;
+	double raw_pct = active_pages > 0 ? (double)st.pages_raw * 100.0 / active_pages : 0.0;
+	double active_pct = total_pages > 0 ? (double)active_pages * 100.0 / total_pages : 0.0;
+
+	/* Format dynamic values with per-layer ratios */
 	char same_saved_buf[32];
 	zram_kernel_fmt_bytes(same_saved_buf, sizeof(same_saved_buf), st.pages_same * B_PAGE_SIZE);
+	uint32_t same_ratio = st.pages_same > 0 ? 10000 : 100;  /* 100:1 for SAME (0 stored bytes) */
 
 	char lz4_stored_buf[32] = "0 B";
 	uint32_t lz4_ratio = 100;
@@ -656,15 +682,6 @@ zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size)
 
 	char raw_stored_buf[32];
 	zram_kernel_fmt_bytes(raw_stored_buf, sizeof(raw_stored_buf), st.pages_raw * B_PAGE_SIZE);
-
-	uint64_t total_pages = st.pages_same + st.pages_raw + st.pages_lz4 + st.pages_empty;
-	uint64_t active_pages = st.pages_same + st.pages_raw + st.pages_lz4;
-	uint32_t ratio = zram_kernel_calc_ratio(st.orig_bytes, st.stored_bytes);
-
-	double same_pct = active_pages > 0 ? (double)st.pages_same * 100.0 / active_pages : 0.0;
-	double lz4_pct = active_pages > 0 ? (double)st.pages_lz4 * 100.0 / active_pages : 0.0;
-	double raw_pct = active_pages > 0 ? (double)st.pages_raw * 100.0 / active_pages : 0.0;
-	double active_pct = total_pages > 0 ? (double)active_pages * 100.0 / total_pages : 0.0;
 
 	int len = snprintf(buf, size,
 		"zram_stats:\n"
@@ -682,17 +699,17 @@ zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size)
 		"  aggregate:\n"
 		"    orig_bytes:       %s\n"
 		"    stored_bytes:     %s\n"
-		"    compression_ratio: %u.%02u%%\n"
+		"    compression_ratio: %u%%\n"
 		"    pool_allocated:   %s\n"
 		"  class_distribution:\n",
 		disk_size_buf, pool_limit_buf,
 		total_pages,
 		active_pages, active_pct,
 		st.pages_empty,
-		st.pages_same, same_pct, ratio, same_saved_buf,
+		st.pages_same, same_pct, same_ratio, same_saved_buf,
 		st.pages_lz4, lz4_pct, lz4_ratio, lz4_stored_buf,
 		st.pages_raw, raw_pct, raw_stored_buf,
-		orig_buf, stored_buf, ratio / 100, ratio % 100, pool_buf);
+		orig_buf, stored_buf, ratio, pool_buf);
 
 	/* Append class distribution */
 	for (uint32_t c = 0; c < ZRAM_CLASS_COUNT && len < (int)size; c++) {
@@ -712,6 +729,9 @@ zram_kernel_stats_snprintf(ZramKernelDevice* dev, char* buf, size_t size)
 	return len;
 }
 
+/* Global console lock for stats output */
+static mutex g_stats_console_lock = MUTEX_INITIALIZER("zram stats console");
+
 int
 zram_kernel_stats_kprintf(ZramKernelDevice* dev)
 {
@@ -723,7 +743,9 @@ zram_kernel_stats_kprintf(ZramKernelDevice* dev)
 	if (len < 0)
 		return -1;
 
+	mutex_lock(&g_stats_console_lock);
 	kprintf("%s", buf);
+	mutex_unlock(&g_stats_console_lock);
 	return len;
 }
 

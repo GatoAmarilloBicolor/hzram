@@ -21,9 +21,13 @@ extern "C" {
 #define ZRAM_PAGE_SIZE			4096u
 #define ZRAM_SPAN_BYTES			(64u * 1024u)
 #define ZRAM_CHUNK_BYTES		(1024u * 1024u)	/* 16 spans por chunk */
-#define ZRAM_STRIPES			64u
 #define ZRAM_MAX_COMPRESSED		4096u  /* H-006: Allow full page storage */
 #define ZRAM_CLASS_COUNT		11u
+
+/* Stripe count: computed at runtime = cpu_count * 8 (min 64, max 1024) */
+#define ZRAM_STRIPES_MIN		64u
+#define ZRAM_STRIPES_MAX		1024u
+#define ZRAM_STRIPES_PER_CPU		8u
 
 static const uint32_t kZramClassSize[ZRAM_CLASS_COUNT] = {
 	256, 384, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096
@@ -48,32 +52,40 @@ enum ZramError {
 };
 
 /*
- * ZramSlot - exactamente 14 bytes (packed, sin padding)
+ * ZramSlot - exactamente 16 bytes (packed, sin padding, alineado a 8 bytes)
  *
- *   [0:8]   data (void*)       -> RAW o LZ4: puntero al objeto
+ *   [0:8]   data (uintptr_t)   -> RAW o LZ4: puntero al objeto como entero
  *           pattern (uint64_t) -> SAME: palabra repetida
  *   [8:12]  size (uint32_t)    -> bytes comprimidos (LZ4); 4096 (RAW); 0 resto
  *   [12:13] state (uint8_t)    -> ZramState
  *   [13:14] cls (uint8_t)      -> clase de tamaño (RAW o LZ4)
+ *   [14:16] reserved (uint16_t)-> uso futuro, cero
  */
 struct ZramSlot {
 	union {
-		void*		data;
+		uintptr_t	data;
 		uint64_t	pattern;
 	};
 	uint32_t		size;
 	uint8_t			state;
 	uint8_t			cls;
-} __attribute__((packed));
+	uint16_t		reserved;
+} __attribute__((packed, aligned(8)));
 
 #ifdef __cplusplus
-static_assert(sizeof(ZramSlot) == 14, "ZramSlot must be exactly 14 bytes (packed)");
+static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes (packed, 8-byte aligned)");
 static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
+#else
+_Static_assert(sizeof(ZramSlot) == 16, "ZramSlot must be exactly 16 bytes (packed, 8-byte aligned)");
+_Static_assert(ZRAM_PAGE_SIZE == 4096, "zram requires 4096-byte pages");
 #endif
 
 /* Motor de compresión CPU. Extensible para GPU futuro. */
 typedef enum {
 	ZRAM_ENGINE_CPU_LZ4      = 0,  /* LZ4 fast (default, latency ~2 us/page) */
+	ZRAM_ENGINE_CPU_LZ4_HC   = 1,  /* LZ4 high compression (~10-15% better ratio) */
+	ZRAM_ENGINE_GPU_OPENCL   = 2,  /* OpenCL GPU acceleration (stub) */
+	ZRAM_ENGINE_GPU_VULKAN   = 3,  /* Vulkan Compute GPU acceleration (stub) */
 	ZRAM_ENGINE_AUTO         = 255 /* auto-selección por heurística */
 } ZramEngine;
 
@@ -105,6 +117,21 @@ struct ZramStats {
 	uint32_t	reserver_capacity;
 	uint32_t	chunk_count;
 	uint32_t	chunk_capacity;
+};
+
+/* Per-CPU counter aggregation (eliminates cache-line ping-pong) */
+struct ZramPerCpuCounters {
+	uint64_t	writes;
+	uint64_t	reads;
+	uint64_t	frees;
+	uint64_t	pages_same;
+	uint64_t	pages_raw;
+	uint64_t	pages_lz4;
+	uint64_t	orig_bytes;
+	uint64_t	stored_bytes;
+	uint64_t	write_nomem;
+	uint64_t	read_corrupt;
+	uint64_t	read_empty;
 };
 
 /*
@@ -157,6 +184,9 @@ void		zram_free_slots(ZramDevice* dev, uint32_t first, uint32_t count);
 bool		zram_can_accept(ZramDevice* dev);
 int			zram_refill(ZramDevice* dev);
 void		zram_get_stats(ZramDevice* dev, ZramStats* out);
+
+/* Counter aggregation - call periodically to merge per-CPU counters */
+void		zram_aggregate_counters(ZramDevice* dev);
 
 /* POSIX-style formatted stats output */
 int			zram_stats_snprintf(char* buf, size_t size, const ZramStats* st,

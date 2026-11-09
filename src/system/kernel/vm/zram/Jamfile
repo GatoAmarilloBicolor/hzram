@@ -14,6 +14,7 @@ KernelMergeObject zram.o :
 	zram_core.cpp
 	zram_kernel.cpp
 	lz4/lz4.c
+	lz4/lz4hc.c
 ;
 
 OBJECTS zram.o ;

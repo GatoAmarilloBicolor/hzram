@@ -153,12 +153,21 @@ diff --git a/src/system/kernel/vm/VMAnonymousCache.cpp b/src/system/kernel/vm/VM
 +    zram_kernel_debug_init();
  
 @@ dump_swap_info(): en el bucle de impresion:
-+    if (file->zram != NULL)
-+        kprintf("  zram: pages: total: %" B_PRIu32 ", free: %" B_PRIu32 "\n",
-+            total, file->bmp->free_slots);
-+    else
-+        kprintf("  vnode: %p, pages: total: %" B_PRIu32 ", free: %"
-+            B_PRIu32 "\n", file->vnode, total, file->bmp->free_slots);
++    uint32_t total = (uint32_t)(file->last_slot - file->first_slot);
++    if (file->zram != NULL) {
++        ZramStats st;
++        zram_get_stats(file->zram->core, &st);
++        uint64_t active_pages = st.pages_same + st.pages_raw + st.pages_lz4;
++        kprintf("  zram: pages: total: %" B_PRIu32 ", used: %" B_PRIu64
++            ", free: %" B_PRIu32 ", stored: %llu B\n",
++            total, active_pages, file->bmp->free_slots,
++            (unsigned long long)st.stored_bytes);
++    } else {
++        kprintf("  vnode: %p, pages: total: %" B_PRIu32
++            ", used: %" B_PRIu32 ", free: %" B_PRIu32 "\n",
++            file->vnode, total, total - file->bmp->free_slots,
++            file->bmp->free_slots);
++    }
  
 @@ swap_file_delete(): al inicio de la funcion:
 +    if (swapFile->zram != NULL)

@@ -63,8 +63,7 @@ extern fs_volume_ops gHzramVolumeOps;
 #define HZRAM_TRACE(x)		/* dprintf x */
 
 
-static struct hzram_volume* sVolume = NULL;
-static mutex sVolumeLock = MUTEX_INITIALIZER("hzramfs volumes");
+
 
 
 /* --------------------------------------------------------------------------
@@ -94,18 +93,26 @@ parse_number(const char* string, uint64 defaultValue)
 	switch (*string) {
 		case 'k':
 		case 'K':
+			if (value > UINT64_MAX / 1024)
+				return defaultValue;
 			value *= 1024;
 			break;
 		case 'm':
 		case 'M':
+			if (value > UINT64_MAX / (1024 * 1024))
+				return defaultValue;
 			value *= 1024 * 1024;
 			break;
 		case 'g':
 		case 'G':
+			if (value > UINT64_MAX / (1024ULL * 1024 * 1024))
+				return defaultValue;
 			value *= 1024ULL * 1024 * 1024;
 			break;
 		case 't':
 		case 'T':
+			if (value > UINT64_MAX / (1024ULL * 1024 * 1024 * 1024))
+				return defaultValue;
 			value *= 1024ULL * 1024 * 1024 * 1024;
 			break;
 		case '%':
@@ -168,21 +175,20 @@ hzram_mem_free(void* pointer)
 static void*
 hzram_chunk_alloc(void* user, size_t bytes)
 {
-	mutex_lock(&sVolumeLock);
 	struct hzram_volume* volume = (struct hzram_volume*)user;
-	if (volume == NULL) {
-		mutex_unlock(&sVolumeLock);
+	if (volume == NULL)
 		return NULL;
-	}
 
+	/* Bump allocator - use volume's lock to serialize */
+	mutex_lock(&volume->lock);
 	if (volume->poolBump + bytes > volume->poolEnd) {
-		mutex_unlock(&sVolumeLock);
+		mutex_unlock(&volume->lock);
 		return NULL;
 	}
 
 	void* chunk = (void*)volume->poolBump;
 	volume->poolBump += bytes;
-	mutex_unlock(&sVolumeLock);
+	mutex_unlock(&volume->lock);
 	return chunk;
 }
 
@@ -191,10 +197,10 @@ static void
 hzram_chunk_free(void* user, void* pointer, size_t bytes)
 {
 	(void)user;
+	(void)pointer;
 	(void)bytes;
-	/* C-001: Real chunk free - use free() since we allocated with malloc in hzram_chunk_alloc */
-	/* Note: In kernel context, this would return to the pool area */
-	free(pointer);
+	/* Bump allocator from wired area (create_area) - no per-chunk free.
+	 * The entire pool area is freed on volume destruction. */
 }
 
 
@@ -425,15 +431,6 @@ hzram_volume_create(fs_volume* fsVolume, const char* args, status_t* _error)
 	strlcpy(volume->name, name, sizeof(volume->name));
 	mutex_init(&volume->lock, "hzramfs volume");
 
-	mutex_lock(&sVolumeLock);
-	if (sVolume != NULL) {
-		mutex_unlock(&sVolumeLock);
-		error = B_BUSY;
-		goto fail;
-	}
-	sVolume = volume;
-	mutex_unlock(&sVolumeLock);
-
 	/* Reserve the compressed pool.  B_FULL_LOCK keeps the swap write path
 	 * free of blocking allocations.  Fall back to a smaller pool if the
 	 * requested one cannot be locked. */
@@ -543,11 +540,6 @@ hzram_volume_destroy(struct hzram_volume* volume)
 
 	if (volume->poolArea >= 0)
 		delete_area(volume->poolArea);
-
-	mutex_lock(&sVolumeLock);
-	if (sVolume == volume)
-		sVolume = NULL;
-	mutex_unlock(&sVolumeLock);
 
 	mutex_destroy(&volume->lock);
 	free(volume);

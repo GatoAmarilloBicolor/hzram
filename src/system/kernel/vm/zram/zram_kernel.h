@@ -16,8 +16,9 @@
 /*
  * swap_addr_t is defined in Haiku's VMAnonymousCache.h.
  * For standalone builds, we define it here to avoid dependency.
+ * Use uint64_t for >4TB swap support (uint32_t limits to 16TB at 4KB pages).
  */
-typedef uint32_t swap_addr_t;
+typedef uint64_t swap_addr_t;
 
 #ifdef __cplusplus
 extern "C" {
